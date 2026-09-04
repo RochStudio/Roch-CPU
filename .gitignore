@@ -1,0 +1,13 @@
+bin/
+obj/
+dist/
+*.user
+*.suo
+.vs/
+Roch CPU.ini
+probe.txt
+vcore.txt
+sio.txt
+smbus.txt
+vtest.txt
+*.bin
