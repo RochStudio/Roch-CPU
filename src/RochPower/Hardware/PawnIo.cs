@@ -24,10 +24,9 @@ public sealed class PawnIo : IDisposable
     private readonly SafeFileHandle _handle;
     private readonly object _lock = new();
 
-    public string ModuleName { get; }
     public string? LastError { get; private set; }
 
-    private PawnIo(SafeFileHandle handle, string module) { _handle = handle; ModuleName = module; }
+    private PawnIo(SafeFileHandle handle) => _handle = handle;
 
     /// <summary>Version of the installed PawnIO, from its uninstall entry; null when it is not installed.</summary>
     public static Version? InstalledVersion
@@ -69,7 +68,7 @@ public sealed class PawnIo : IDisposable
             h.Dispose();
             throw new IOException($"PawnIO refused the module {Path.GetFileName(path)} ({new System.ComponentModel.Win32Exception(err).Message}). Only modules signed for PawnIO load; try a newer PawnIO.");
         }
-        return new PawnIo(h, Path.GetFileNameWithoutExtension(path));
+        return new PawnIo(h);
     }
 
     /// <summary>

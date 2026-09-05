@@ -128,9 +128,11 @@ care who made the board.
 
 The SMU is reached through the SMN index/data pair in the north bridge's PCI configuration
 space (D0F0 0x60 / 0x64) under the same `Global\Access_PCI` mutex HWiNFO, Ryzen Master and
-ZenStates take, so Roch CPU can run beside them. Message numbers and mailbox addresses per
-generation come from ZenStates-Core (see the notices file); nothing was copied, and the
-numbers this build was tested against are marked as such in the source.
+ZenStates take, so Roch CPU can run beside them. The message numbers and mailbox addresses per
+generation, the Curve Optimizer core addressing and the fuse map come from **Ivan Rusanov's
+[ZenStates-Core](https://github.com/irusanov/ZenStates-Core)**, the library behind ZenStates
+and SMUDebugTool; without his years of SMU work none of this would exist. Nothing was copied
+(see the notices file), and the numbers this build was tested against are marked in the source.
 
 **Reading the limits back needs PawnIO.** There is no SMU message that reports the PPT / TDC /
 EDC limit currently in force. Every tool that shows it reads the *power table* the SMU
@@ -177,8 +179,8 @@ Diagnostics: `--probe` prints the topology with each core's SMU address, the SMU
 version, stock limits, scalar, boost limit and every core's Curve Optimizer value;
 `--smu rsmu|mp1|hsmp 0xMSG [args]` sends one raw mailbox message and prints the six argument
 registers (research only, it goes straight to the firmware); `--apply <row> <value>` applies
-one row through the same path the window uses; `--pm-dump` dumps the power table if a future
-driver can read it.
+one row through the same path the window uses; `--pm-dump` dumps the whole power table (needs
+PawnIO) and `--smn 0xADDR [count]` reads SMN registers, both for porting to a new firmware.
 
 ## Boards
 

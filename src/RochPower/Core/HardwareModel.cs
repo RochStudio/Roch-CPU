@@ -210,13 +210,11 @@ public sealed class HardwareModel : IDisposable
             {
                 Emit("SMU " + ts);
                 bool pawn = Amd.Smu.TryAttachPawnIo(Path.Combine(AppContext.BaseDirectory, "pawnio", "RyzenSMU.bin"), out string ps);
-                Emit((pawn ? "Power table: " : "Power table via WinRing0 only: ") + ps);
-                bool ok = Amd.Smu.RefreshTable();
-                Emit($"Power table read {(ok ? "OK via " + Amd.Smu.TableSource : "failed: " + Amd.Smu.LastTableError)}");
-                if (ok && Amd.Smu.Layout != null)
-                    Emit($"Limits in force from the table ({Amd.Smu.Layout.Name}): PPT {Amd.Smu.PptLimit?.ToString("0") ?? "?"} W (drawing {Amd.Smu.PptValue:0.0}), TDC {Amd.Smu.TdcLimit?.ToString("0") ?? "?"} A (drawing {Amd.Smu.TdcValue:0.0}), EDC {Amd.Smu.EdcLimit?.ToString("0") ?? "?"} A (drawing {Amd.Smu.EdcValue:0.0}), Tctl max {Amd.Smu.ThmLimit?.ToString("0") ?? "?"} C, socket {Amd.Smu.SocketPower:0.0} W");
-                else if (ok) Emit("The limit positions in this table version are not known; PPT/TDC/EDC rows show Auto until written.");
-                else Emit("PPT/TDC/EDC rows show Auto (the BIOS value is not readable) until a value is written here.");
+                Emit("Power table: " + ps);
+                if (!pawn) Emit("PPT/TDC/EDC rows show Auto (the BIOS value is not readable) until a value is written here.");
+                else if (!Amd.Smu.RefreshTable()) Emit("Power table read failed: " + Amd.Smu.LastTableError);
+                else if (Amd.Smu.Layout == null) Emit("The limit positions in this table version are not known; PPT/TDC/EDC rows show Auto until written.");
+                else Emit($"Limits in force from the table ({Amd.Smu.Layout.Name}): PPT {Amd.Smu.PptLimit?.ToString("0") ?? "?"} W (drawing {Amd.Smu.PptValue:0.0}), TDC {Amd.Smu.TdcLimit?.ToString("0") ?? "?"} A (drawing {Amd.Smu.TdcValue:0.0}), EDC {Amd.Smu.EdcLimit?.ToString("0") ?? "?"} A (drawing {Amd.Smu.EdcValue:0.0}), Tctl max {Amd.Smu.ThmLimit?.ToString("0") ?? "?"} C, socket {Amd.Smu.SocketPower:0.0} W");
             }
             else Emit("SMU power table: " + ts);
         }
@@ -342,7 +340,7 @@ public sealed class HardwareModel : IDisposable
     /// <summary>Refreshes the SMU power table at most every 300 ms; three rows read from it in a row.</summary>
     private bool TableFresh()
     {
-        if (Amd?.Smu is not { TableAddress: not 0, TableUnreadable: false } smu) return false;
+        if (Amd?.Smu is not { TableReadable: true } smu) return false;
         if ((DateTime.UtcNow - _tableReadAt).TotalMilliseconds < 300 && smu.Table != null) return true;
         bool ok = smu.RefreshTable();
         if (ok) _tableReadAt = DateTime.UtcNow;
@@ -372,7 +370,7 @@ public sealed class HardwareModel : IDisposable
         // ---------------- power / current limits ----------------
         double? Limit(string id, Func<float?> field)
         {
-            if (smu.Layout != null && !smu.LayoutContradicted && TableFresh() && field() is float f && f > 0) return Math.Round(f);
+            if (TableFresh() && field() is float f && f > 0) return Math.Round(f);
             return _lastWritten.TryGetValue(id, out double v) ? v : null;
         }
         void WriteLimit(string id, string label, Action<double> write, Func<float?> field, double value)
@@ -385,9 +383,9 @@ public sealed class HardwareModel : IDisposable
             else if (followed == false)
                 Emit($"{label}: the SMU accepted {value:0} but the power table float this build expected for {label} did not follow. The limit is applied; this row now shows what is written here instead of reading it back. Please report your CPU and table version 0x{smu.TableVersion:X8}.");
         }
-        string tableNote = smu.TableUnreadable || smu.Layout == null
-            ? " The SMU has no message that reports the limit currently in force and, without PawnIO, the SMU's power table cannot be read, so the row starts as Auto (whatever the BIOS set) and then shows what was written here."
-            : $" Read back from the SMU power table through {smu.TableSource}.";
+        string tableNote = smu.TableReadable && smu.Layout != null
+            ? " Read back from the SMU power table through PawnIO."
+            : " The SMU has no message that reports the limit in force and, without PawnIO, its power table cannot be read, so the row starts as Auto (whatever the BIOS set) and then shows what was written here.";
         Action? Stock(string id, double? stock, Action<double> write) => stock is double v ? () => { write(v); _lastWritten[id] = v; } : null;
         string StockNote(double? v, string unit) => v is double d ? $" Entering 0 writes the CPU's stock value ({d:0} {unit}); the BIOS value itself only comes back with a reboot." : "";
         Settings.Add(new Setting
@@ -421,7 +419,7 @@ public sealed class HardwareModel : IDisposable
         {
             Id = "tctl", Name = "Thermal Limit (Tctl max)", Group = SettingGroup.Power, Unit = "C", Min = 50, Max = 115, Decimals = 0,
             Read = () => live ? Limit("tctl", () => smu.ThmLimit) : null,
-            Write = live && msgs.RsmuSetTctlMax != 0 ? v => WriteLimit("tctl", "Tctl max", t => { var st = smu.SendRsmu(msgs.RsmuSetTctlMax, new uint[] { (uint)Math.Round(t), 0, 0, 0, 0, 0 }); if (st != Hardware.SmuStatus.Ok) throw new IOException("Tctl max: " + AmdSmu.Describe(st) + "."); }, () => smu.ThmLimit, v) : null,
+            Write = live && msgs.RsmuSetTctlMax != 0 ? v => WriteLimit("tctl", "Tctl max", smu.SetTctlMax, () => smu.ThmLimit, v) : null,
             Note = "Temperature the boost algorithm holds the CPU to, in degrees C (SetTctlMax). Lower it to trade a little clock for a quieter, cooler CPU." + tableNote,
             Available = live && msgs.RsmuSetTctlMax != 0
         });
@@ -705,7 +703,7 @@ public sealed class HardwareModel : IDisposable
                 st.CoreMHz = mhz; st.CoreRatio = (int)Math.Round(mhz / 100.0);
             }
             catch { }
-            try { st.CoreVid = SmuAvailable && TableFresh() && Amd.Smu.VddcrCpu is float v && v > 0.2 ? Math.Round(v, 3) : Amd.ReadCoreVid(); } catch { }
+            try { st.CoreVid = Amd.ReadCoreVid(); } catch { }
             try { st.PackageWatts = PowerFromEnergy(Amd.ReadPackageEnergyJoules()); } catch { }
         }
         return st;

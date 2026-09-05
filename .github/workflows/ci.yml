@@ -29,6 +29,11 @@ jobs:
           $expected = '11BD2C9F9E2397C9A16E0990E4ED2CF0679498FE0FD418A3DFDAC60B5C160EE5'
           if ($hash -ne $expected) { throw "WinRing0x64.sys hash $hash does not match $expected" }
           Write-Output "driver ok: $hash"
+          $mod = 'dist/pawnio/RyzenSMU.bin'
+          if (-not (Test-Path $mod)) { throw "$mod is missing from the build output" }
+          $mhash = (Get-FileHash $mod -Algorithm SHA256).Hash
+          if ($mhash -ne 'B84ECA7F32C63B3D8C14B2C6D45482706DF8683AA6F43EB8BEAD9DC62181D38F') { throw "RyzenSMU.bin hash $mhash is not the signed 0.2.4 module" }
+          Write-Output "pawnio module ok: $mhash"
 
       - uses: actions/upload-artifact@v4
         with:

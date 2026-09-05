@@ -502,7 +502,7 @@ internal static class Program
                     W($"Table        : v0x{smu.TableVersion:X8} at 0x{smu.TableAddress:X} size 0x{smu.TableSize:X} layout {smu.Layout?.Name ?? "unknown"}");
                     if (smu.RefreshTable() && smu.Table is { } t)
                     {
-                        W($"  limits     : PPT {smu.PptLimit:0.##}/{smu.PptValue:0.##} W  TDC {smu.TdcLimit:0.##}/{smu.TdcValue:0.##} A  EDC {smu.EdcLimit:0.##}/{smu.EdcValue:0.##} A  THM {smu.ThmLimit:0.##} C  socket {smu.SocketPower:0.##} W  VDDCR {smu.VddcrCpu:0.###} V");
+                        W($"  limits     : PPT {smu.PptLimit:0.##}/{smu.PptValue:0.##} W  TDC {smu.TdcLimit:0.##}/{smu.TdcValue:0.##} A  EDC {smu.EdcLimit:0.##}/{smu.EdcValue:0.##} A  THM {smu.ThmLimit:0.##} C  socket {smu.SocketPower:0.##} W");
                         var line = new StringBuilder("  table[0..63]:");
                         for (int i = 0; i < Math.Min(64, t.Length); i++) { if (i % 8 == 0) line.Append($"\n    {i,3}:"); line.Append($" {t[i],10:0.###}"); }
                         W(line.ToString());

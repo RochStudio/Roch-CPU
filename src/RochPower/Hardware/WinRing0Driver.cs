@@ -32,7 +32,6 @@ public sealed unsafe class WinRing0Driver : IKernelDriver
     private static readonly uint IOCTL_WRITE_IO_PORT_DWORD = CtlCode(0x838, FILE_WRITE_ACCESS);
     private static readonly uint IOCTL_READ_PCI_CONFIG = CtlCode(0x851, FILE_READ_ACCESS);
     private static readonly uint IOCTL_WRITE_PCI_CONFIG = CtlCode(0x852, FILE_WRITE_ACCESS);
-    private static readonly uint IOCTL_READ_MEMORY = CtlCode(0x841, FILE_READ_ACCESS);
 
     private SafeFileHandle? _handle;
     private bool _installedByUs;
@@ -239,22 +238,6 @@ public sealed unsafe class WinRing0Driver : IKernelDriver
     {
         var input = new WritePciInput { PciAddress = PciAddress(bus, device, function), Offset = offset, Data = value };
         return Ioctl(IOCTL_WRITE_PCI_CONFIG, &input, (uint)sizeof(WritePciInput), null, 0);
-    }
-
-    // ------------------------------------------------------------ physical memory
-    [StructLayout(LayoutKind.Sequential, Pack = 1)]
-    private struct ReadMemoryInput { public ulong Address; public uint UnitSize; public uint Count; }
-
-    /// <summary>
-    /// OLS_READ_MEMORY: the driver maps the physical range and copies it out. This is how every
-    /// AMD monitoring tool reads the SMU power table; it never writes.
-    /// </summary>
-    public bool ReadPhysicalMemory(ulong address, byte[] buffer)
-    {
-        if (buffer.Length == 0) return true;
-        var input = new ReadMemoryInput { Address = address, UnitSize = 1, Count = (uint)buffer.Length };
-        fixed (byte* p = buffer)
-            return Ioctl(IOCTL_READ_MEMORY, &input, (uint)sizeof(ReadMemoryInput), p, (uint)buffer.Length);
     }
 
     // ------------------------------------------------------------- plumbing
