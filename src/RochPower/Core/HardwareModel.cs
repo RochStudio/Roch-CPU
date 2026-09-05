@@ -1,3 +1,5 @@
+using System.Runtime.Intrinsics.X86;
+using System.Text;
 using RochPower.Hardware;
 
 namespace RochPower.Core;
@@ -25,10 +27,14 @@ public sealed class HardwareModel : IDisposable
     public event Action<string>? Log;
 
     public IKernelDriver? Driver { get; private set; }
+    /// <summary>Intel LGA1700 path. Null on AMD.</summary>
     public IntelCpu? Cpu { get; private set; }
+    /// <summary>AMD Zen path. Null on Intel.</summary>
+    public AmdCpu? Amd { get; private set; }
+    public bool IsAmd => Amd != null;
     public SmbiosInfo Smbios { get; private set; } = SmbiosInfo.Read();
     public BclkMeter? Bclk { get; private set; }
-    public SmbusI801? Smbus { get; private set; }
+    public ISmbus? Smbus { get; private set; }
     public SuperIo? SuperIo { get; private set; }
     public string SuperIoStatus { get; private set; } = "not probed";
     public List<Ddr5Dimm> Dimms { get; } = new();
@@ -43,9 +49,42 @@ public sealed class HardwareModel : IDisposable
     public bool PowerLimitsLocked { get; private set; }
     public double? LastBclk { get; private set; }
 
+    // AMD
+    public bool SmuAvailable { get; private set; }
+    public string SmuStatus { get; private set; } = "not probed";
+    /// <summary>IsOverclockable flags from the SMU: bit 0 OC allowed, bit 1 power limits, bit 2 PBO. Null when not answered.</summary>
+    public uint? OcCapabilities { get; private set; }
+    public bool PboAllowed => OcCapabilities is not uint c || (c & 0x4) != 0;
+    /// <summary>The CPU's fused stock PPT / TDC / EDC, what "0" restores on those rows.</summary>
+    public (double? ppt, double? tdc, double? edc) StockLimits { get; private set; }
+
+    // ---- header text that does not care which vendor is underneath
+    public string CpuName => Cpu?.BrandString ?? Amd?.BrandString ?? "No CPU access";
+    /// <summary>Intel shows the generation under the CPU name; on AMD the brand string already says it all.</summary>
+    public string CpuGeneration => Cpu?.Generation ?? "";
+    public string CoreSummary
+    {
+        get
+        {
+            if (Cpu is { } c)
+                return c.ECoreCount > 0 ? $"{c.PCoreCount}P + {c.ECoreCount}E cores, {c.LogicalCpus.Count} threads" : $"{c.PCoreCount} cores, {c.LogicalCpus.Count} threads";
+            if (Amd is { } a)
+                return $"{a.CoreCount} cores, {a.LogicalCount} threads" + (a.CcdCount > 1 ? $", {a.CcdCount} CCDs" : "");
+            return "";
+        }
+    }
+    public int BaseRatio => Cpu?.BaseRatio ?? Amd?.BaseRatio ?? 0;
+
     private double _lastEnergyJ; private DateTime _lastEnergyAt;
 
     private void Emit(string msg) => Log?.Invoke(msg);
+
+    private static bool IsAmdVendor()
+    {
+        var l0 = X86Base.CpuId(0, 0);
+        string vendor = Encoding.ASCII.GetString(BitConverter.GetBytes(l0.Ebx)) + Encoding.ASCII.GetString(BitConverter.GetBytes(l0.Edx)) + Encoding.ASCII.GetString(BitConverter.GetBytes(l0.Ecx));
+        return vendor is "AuthenticAMD" or "HygonGenuine";
+    }
 
     /// <summary>Opens the driver and probes the hardware. Never throws: failures are logged and the affected rows become unavailable.</summary>
     public void Initialize()
@@ -66,31 +105,7 @@ public sealed class HardwareModel : IDisposable
 
         if (Driver != null)
         {
-            try
-            {
-                Cpu = new IntelCpu(Driver);
-                Emit($"CPU: {Cpu.BrandString} - {Cpu.Generation}, {Cpu.PCoreCount}P + {Cpu.ECoreCount}E cores, base ratio {Cpu.BaseRatio}, TjMax {Cpu.TjMax} C");
-                if (!Cpu.IsLga1700Family) Emit("Warning: this CPU is not a known LGA1700 (12th-14th Gen desktop) part. Ratio/voltage controls may not behave as expected.");
-                OcLocked = Cpu.IsOcLocked;
-                if (OcLocked) Emit("Warning: BIOS has set OC Lock (MSR 0x194 bit 20). Ratio and voltage changes will be rejected on this board/chipset.");
-                MailboxAvailable = Cpu.Mailbox.IsAvailable;
-                if (!MailboxAvailable) Emit("OC mailbox (MSR 0x150) not responding; FIVR voltage rows disabled.");
-                else
-                {
-                    try
-                    {
-                        var core = Cpu.Mailbox.ReadDomain(OcMailbox.DOMAIN_CORE);
-                        BiosCoreOverride = core.OverrideMode;
-                        if (BiosCoreOverride)
-                            Emit($"BIOS has the core voltage in Override mode ({core.TargetVolts:0.000} V fixed VID). MSI boards also pin the VRM output in this mode, so " +
-                                 "CPU Core Voltage here moves only the VID the CPU requests and the real Vcore stays where the BIOS put it. " +
-                                 "Set the BIOS CPU Core Voltage Mode to Adaptive or Auto to control Vcore from here. " +
-                                 "Watch the Vcore tile against VID to confirm which is happening.");
-                    }
-                    catch { }
-                }
-            }
-            catch (Exception ex) { Emit("CPU init error: " + ex.Message); }
+            if (IsAmdVendor()) InitializeAmd(); else InitializeIntel();
 
             try
             {
@@ -101,13 +116,17 @@ public sealed class HardwareModel : IDisposable
 
             try
             {
-                Smbus = SmbusI801.TryCreate(Driver, out string st);
+                string st;
+                Smbus = IsAmd ? SmbusPiix4.TryCreate(Driver, out st) : SmbusI801.TryCreate(Driver, out st);
                 SmbusStatus = st;
                 Emit("SMBus: " + st);
                 if (Smbus != null)
                 {
                     Dimms.AddRange(Ddr5Dimm.Probe(Smbus));
-                    if (Dimms.Count == 0) Emit("No DDR5 SPD5118 hubs found on the SMBus (DDR4 board, or DIMM SMBus segment not routed through the PCH).");
+                    if (Dimms.Count == 0)
+                        Emit(IsAmd
+                            ? "No DDR5 SPD5118 hubs answer on the FCH SMBus port the BIOS left selected. The DIMMs may sit on another port of the FCH mux, which needs an MMIO write this driver cannot do; the memory rows stay hidden."
+                            : "No DDR5 SPD5118 hubs found on the SMBus (DDR4 board, or DIMM SMBus segment not routed through the PCH).");
                     foreach (var d in Dimms)
                     {
                         Emit($"{d.SlotName}: SPD at 0x{d.SpdAddress:X2}, PMIC {(d.HasPmic ? $"at 0x{d.PmicAddress:X2} ({d.PmicVendor})" : "not reachable")}");
@@ -135,9 +154,86 @@ public sealed class HardwareModel : IDisposable
         RefreshAll(captureDefaults: true);
     }
 
+    private void InitializeIntel()
+    {
+        try
+        {
+            Cpu = new IntelCpu(Driver!);
+            Emit($"CPU: {Cpu.BrandString} - {Cpu.Generation}, {Cpu.PCoreCount}P + {Cpu.ECoreCount}E cores, base ratio {Cpu.BaseRatio}, TjMax {Cpu.TjMax} C");
+            if (!Cpu.IsLga1700Family) Emit("Warning: this CPU is not a known LGA1700 (12th-14th Gen desktop) part. Ratio/voltage controls may not behave as expected.");
+            OcLocked = Cpu.IsOcLocked;
+            if (OcLocked) Emit("Warning: BIOS has set OC Lock (MSR 0x194 bit 20). Ratio and voltage changes will be rejected on this board/chipset.");
+            MailboxAvailable = Cpu.Mailbox.IsAvailable;
+            if (!MailboxAvailable) Emit("OC mailbox (MSR 0x150) not responding; FIVR voltage rows disabled.");
+            else
+            {
+                try
+                {
+                    var core = Cpu.Mailbox.ReadDomain(OcMailbox.DOMAIN_CORE);
+                    BiosCoreOverride = core.OverrideMode;
+                    if (BiosCoreOverride)
+                        Emit($"BIOS has the core voltage in Override mode ({core.TargetVolts:0.000} V fixed VID). MSI boards also pin the VRM output in this mode, so " +
+                             "CPU Core Voltage here moves only the VID the CPU requests and the real Vcore stays where the BIOS put it. " +
+                             "Set the BIOS CPU Core Voltage Mode to Adaptive or Auto to control Vcore from here. " +
+                             "Watch the Vcore tile against VID to confirm which is happening.");
+                }
+                catch { }
+            }
+        }
+        catch (Exception ex) { Emit("CPU init error: " + ex.Message); }
+    }
+
+    private void InitializeAmd()
+    {
+        try
+        {
+            Amd = new AmdCpu(Driver!);
+            Emit($"CPU: {Amd.BrandString} - {Amd.CodeName} ({Amd.Generation}), family {Amd.Family:X}h model {Amd.Model:X2}h stepping {Amd.Stepping}, " +
+                 $"{Amd.CoreCount} cores / {Amd.LogicalCount} threads, P0 ratio {Amd.BaseRatio}, microcode 0x{Amd.PatchLevel:X8}");
+            Emit($"Topology: {Amd.TopologyNote}: " + string.Join(", ", Amd.Cores.Select(c => $"{c.Label}={c.Location}")));
+            if (!Amd.IsSupported) { Emit("Warning: unknown Zen generation. The SMU message numbers of Zen 4 / Zen 5 are assumed; nothing is written until the SMU answers the test message."); }
+
+            SmuAvailable = Amd.Smu.Probe();
+            SmuStatus = Amd.Smu.Status;
+            Emit("SMU: " + SmuStatus);
+            if (!SmuAvailable) return;
+
+            OcCapabilities = Amd.Smu.ReadOcCapabilities();
+            if (OcCapabilities is uint caps)
+                Emit($"SMU overclocking capabilities 0x{caps:X}: OC {((caps & 1) != 0 ? "allowed" : "locked")}, power limits {((caps & 2) != 0 ? "adjustable" : "locked")}, PBO {((caps & 4) != 0 ? "available" : "not available (enable Precision Boost Overdrive in the BIOS)")}");
+            StockLimits = Amd.Smu.ReadStockLimits();
+            if (StockLimits.ppt != null || StockLimits.tdc != null || StockLimits.edc != null)
+                Emit($"Stock limits fused into this CPU: PPT {StockLimits.ppt?.ToString("0") ?? "n/a"} W, TDC {StockLimits.tdc?.ToString("0") ?? "n/a"} A, EDC {StockLimits.edc?.ToString("0") ?? "n/a"} A (what 0 writes on those rows).");
+            if (Amd.Smu.ReadSustainedLimits() is { } sl) Emit($"Platform sustained limits: {sl.power} W, {sl.temp} C");
+
+            if (Amd.Smu.LocateTable(out string ts))
+            {
+                Emit("SMU " + ts);
+                bool pawn = Amd.Smu.TryAttachPawnIo(Path.Combine(AppContext.BaseDirectory, "pawnio", "RyzenSMU.bin"), out string ps);
+                Emit((pawn ? "Power table: " : "Power table via WinRing0 only: ") + ps);
+                bool ok = Amd.Smu.RefreshTable();
+                Emit($"Power table read {(ok ? "OK via " + Amd.Smu.TableSource : "failed: " + Amd.Smu.LastTableError)}");
+                if (ok && Amd.Smu.Layout != null)
+                    Emit($"Limits in force from the table ({Amd.Smu.Layout.Name}): PPT {Amd.Smu.PptLimit?.ToString("0") ?? "?"} W (drawing {Amd.Smu.PptValue:0.0}), TDC {Amd.Smu.TdcLimit?.ToString("0") ?? "?"} A (drawing {Amd.Smu.TdcValue:0.0}), EDC {Amd.Smu.EdcLimit?.ToString("0") ?? "?"} A (drawing {Amd.Smu.EdcValue:0.0}), Tctl max {Amd.Smu.ThmLimit?.ToString("0") ?? "?"} C, socket {Amd.Smu.SocketPower:0.0} W");
+                else if (ok) Emit("The limit positions in this table version are not known; PPT/TDC/EDC rows show Auto until written.");
+                else Emit("PPT/TDC/EDC rows show Auto (the BIOS value is not readable) until a value is written here.");
+            }
+            else Emit("SMU power table: " + ts);
+        }
+        catch (Exception ex) { Emit("CPU init error: " + ex.Message); }
+    }
+
     private void BuildSettings()
     {
         Settings.Clear();
+        if (Amd != null) BuildAmdSettings();
+        else { BuildIntelSettings(); BuildBoardRails(); }
+        BuildDimms();
+    }
+
+    // ------------------------------------------------------------------ Intel rows
+    private void BuildIntelSettings()
+    {
         var cpu = Cpu;
 
         // ---------------- clocks ----------------
@@ -165,14 +261,7 @@ public sealed class HardwareModel : IDisposable
             Note = "Maximum ring/uncore multiplier. Written to the OC mailbox ring domain and MSR 0x620; on Alder/Raptor Lake only the mailbox value takes effect.",
             Available = cpu != null
         });
-        Settings.Add(new Setting
-        {
-            Id = "bclk", Name = "Base Clock", Group = SettingGroup.Clocks, Min = 10, Max = 655.25, Decimals = 2,
-            Read = () => LastBclk,
-            Write = null,
-            Note = "Measured from TSC vs ACPI timer. Read-only: BCLK programming needs the Intel ICC (clock controller) interface, which is board firmware specific.",
-            Available = Bclk?.IsAvailable == true
-        });
+        AddBclkRow();
 
         // ---------------- FIVR voltages via OC mailbox ----------------
         var mb = cpu?.Mailbox;
@@ -230,30 +319,196 @@ public sealed class HardwareModel : IDisposable
             Note = PowerLimitsLocked ? "Locked by BIOS (MSR 0x610 bit 63)." : "Short duration package power limit (MSR 0x610).",
             Available = cpu != null
         });
+    }
 
-        // ---------------- board VRM rails ----------------
+    private void AddBclkRow()
+    {
+        Settings.Add(new Setting
+        {
+            Id = "bclk", Name = "Base Clock", Group = SettingGroup.Clocks, Min = 10, Max = 655.25, Decimals = 2,
+            Read = () => LastBclk,
+            Write = null,
+            Note = "Measured from TSC vs ACPI timer. Read-only: BCLK programming needs the board's clock generator, which is board firmware specific.",
+            Available = Bclk?.IsAvailable == true && BaseRatio > 0
+        });
+    }
+
+    // ------------------------------------------------------------------ AMD rows
+    // What was last written here, for the rows whose firmware has no read-back path.
+    private readonly Dictionary<string, double> _lastWritten = new();
+    private readonly Dictionary<int, int> _lastCo = new();
+    private DateTime _tableReadAt;
+
+    /// <summary>Refreshes the SMU power table at most every 300 ms; three rows read from it in a row.</summary>
+    private bool TableFresh()
+    {
+        if (Amd?.Smu is not { TableAddress: not 0, TableUnreadable: false } smu) return false;
+        if ((DateTime.UtcNow - _tableReadAt).TotalMilliseconds < 300 && smu.Table != null) return true;
+        bool ok = smu.RefreshTable();
+        if (ok) _tableReadAt = DateTime.UtcNow;
+        return ok || smu.Table != null;
+    }
+
+    private void BuildAmdSettings()
+    {
+        var amd = Amd!;
+        var smu = amd.Smu;
+        var msgs = smu.Messages;
+        bool live = SmuAvailable;
+        bool pbo = live && PboAllowed;
+        string pboNote = pbo ? "" : " PBO is reported as unavailable by the SMU: enable Precision Boost Overdrive in the BIOS, or the write will be rejected.";
+
+        // ---------------- clocks ----------------
+        Settings.Add(new Setting
+        {
+            Id = "fmax", Name = "FMax", Group = SettingGroup.Clocks, Unit = "MHz", Min = 1000, Max = 8000, Decimals = 0,
+            Read = () => live ? smu.ReadBoostLimitMHz() : null,
+            Write = live && msgs.RsmuSetBoostLimitAll != 0 ? v => smu.SetBoostLimitMHz((int)Math.Round(v)) : null,
+            Note = "Ceiling for the all-core boost clock (the SMU's boost limit, what the BIOS calls Max CPU Boost Clock Override / FMax). Raising it only helps if the CPU has thermal, current and power headroom left. 0 restores the start-up value.",
+            Available = live && msgs.HasBoostLimit
+        });
+        AddBclkRow();
+
+        // ---------------- power / current limits ----------------
+        double? Limit(string id, Func<float?> field)
+        {
+            if (smu.Layout != null && !smu.LayoutContradicted && TableFresh() && field() is float f && f > 0) return Math.Round(f);
+            return _lastWritten.TryGetValue(id, out double v) ? v : null;
+        }
+        void WriteLimit(string id, string label, Action<double> write, Func<float?> field, double value)
+        {
+            write(value);
+            _lastWritten[id] = value;
+            bool? followed = smu.VerifyLayout(id, field, value);
+            _tableReadAt = default;
+            if (followed == true) Emit($"{label}: the power table confirms {value:0}.");
+            else if (followed == false)
+                Emit($"{label}: the SMU accepted {value:0} but the power table float this build expected for {label} did not follow. The limit is applied; this row now shows what is written here instead of reading it back. Please report your CPU and table version 0x{smu.TableVersion:X8}.");
+        }
+        string tableNote = smu.TableUnreadable || smu.Layout == null
+            ? " The SMU has no message that reports the limit currently in force and, without PawnIO, the SMU's power table cannot be read, so the row starts as Auto (whatever the BIOS set) and then shows what was written here."
+            : $" Read back from the SMU power table through {smu.TableSource}.";
+        Action? Stock(string id, double? stock, Action<double> write) => stock is double v ? () => { write(v); _lastWritten[id] = v; } : null;
+        string StockNote(double? v, string unit) => v is double d ? $" Entering 0 writes the CPU's stock value ({d:0} {unit}); the BIOS value itself only comes back with a reboot." : "";
+        Settings.Add(new Setting
+        {
+            Id = "ppt", Name = "PPT (Package Power Tracking)", Group = SettingGroup.Power, Unit = "W", Min = 5, Max = 2000, Decimals = 0,
+            Read = () => live ? Limit("ppt", () => smu.PptLimit) : null,
+            Write = live && msgs.HasPowerLimits ? v => WriteLimit("ppt", "PPT", smu.SetPpt, () => smu.PptLimit, v) : null,
+            RestoreDefault = live ? Stock("ppt", StockLimits.ppt, smu.SetPpt) : null,
+            Note = "Total socket power the boost algorithm may use, in watts (SMU message SetPPTLimit)." + tableNote + StockNote(StockLimits.ppt, "W") + pboNote,
+            Available = live && msgs.HasPowerLimits
+        });
+        Settings.Add(new Setting
+        {
+            Id = "tdc", Name = "TDC (Thermal Design Current)", Group = SettingGroup.Power, Unit = "A", Min = 5, Max = 2000, Decimals = 0,
+            Read = () => live ? Limit("tdc", () => smu.TdcLimit) : null,
+            Write = live && msgs.HasCurrentLimits ? v => WriteLimit("tdc", "TDC", smu.SetTdc, () => smu.TdcLimit, v) : null,
+            RestoreDefault = live ? Stock("tdc", StockLimits.tdc, smu.SetTdc) : null,
+            Note = "Sustained current the VRM may deliver on the core rail, in amperes, thermally limited (SetTDCVDDLimit)." + tableNote + StockNote(StockLimits.tdc, "A") + pboNote,
+            Available = live && msgs.HasCurrentLimits
+        });
+        Settings.Add(new Setting
+        {
+            Id = "edc", Name = "EDC (Electrical Design Current)", Group = SettingGroup.Power, Unit = "A", Min = 5, Max = 2000, Decimals = 0,
+            Read = () => live ? Limit("edc", () => smu.EdcLimit) : null,
+            Write = live && msgs.HasCurrentLimits ? v => WriteLimit("edc", "EDC", smu.SetEdc, () => smu.EdcLimit, v) : null,
+            RestoreDefault = live ? Stock("edc", StockLimits.edc, smu.SetEdc) : null,
+            Note = "Peak current the VRM may deliver on the core rail, in amperes (SetEDCVDDLimit)." + tableNote + StockNote(StockLimits.edc, "A") + pboNote,
+            Available = live && msgs.HasCurrentLimits
+        });
+        Settings.Add(new Setting
+        {
+            Id = "tctl", Name = "Thermal Limit (Tctl max)", Group = SettingGroup.Power, Unit = "C", Min = 50, Max = 115, Decimals = 0,
+            Read = () => live ? Limit("tctl", () => smu.ThmLimit) : null,
+            Write = live && msgs.RsmuSetTctlMax != 0 ? v => WriteLimit("tctl", "Tctl max", t => { var st = smu.SendRsmu(msgs.RsmuSetTctlMax, new uint[] { (uint)Math.Round(t), 0, 0, 0, 0, 0 }); if (st != Hardware.SmuStatus.Ok) throw new IOException("Tctl max: " + AmdSmu.Describe(st) + "."); }, () => smu.ThmLimit, v) : null,
+            Note = "Temperature the boost algorithm holds the CPU to, in degrees C (SetTctlMax). Lower it to trade a little clock for a quieter, cooler CPU." + tableNote,
+            Available = live && msgs.RsmuSetTctlMax != 0
+        });
+
+        // ---------------- PBO ----------------
+        Settings.Add(new Setting
+        {
+            Id = "scalar", Name = "PBO Scalar", Group = SettingGroup.Pbo, Unit = "x", Min = 1, Max = 10, Decimals = 0,
+            Read = () => live ? smu.ReadScalar() : null,
+            Write = live && msgs.HasScalar ? v => smu.SetScalar(v) : null,
+            Note = "Precision Boost Overdrive scalar, 1x to 10x: how far past the silicon's fused voltage/reliability envelope the boost algorithm may sustain. 1 is stock." + (msgs.RsmuGetScalar != 0 ? " Read back from the SMU; a read-back of 0 means the SMU is in manual overclock mode." : "") + pboNote,
+            Available = live && msgs.HasScalar
+        });
+        int range = msgs.CoRange;
+        Settings.Add(new Setting
+        {
+            Id = "co_all", Name = "Curve Optimizer (all cores)", Group = SettingGroup.Pbo, Unit = "", Min = -range, Max = range, Decimals = 0,
+            Read = () =>
+            {
+                if (!live || !msgs.HasCurveOptimizerReadback) return _lastWritten.TryGetValue("co_all", out double v) ? v : null;
+                var margins = amd.Cores.Select(ReadCurveOptimizer).ToList();
+                if (margins.Any(m => m == null)) return null;
+                return margins.Distinct().Count() == 1 ? margins[0] : null;
+            },
+            Write = live && msgs.HasCurveOptimizer ? v =>
+            {
+                int m = (int)Math.Round(v);
+                smu.SetCurveOptimizerAll(m);
+                _lastWritten["co_all"] = m;
+                foreach (var c in amd.Cores) _lastCo[c.Index] = m;
+            } : null,
+            RestoreDefault = live && msgs.HasCurveOptimizer ? () =>
+            {
+                smu.SetCurveOptimizerAll(0);
+                _lastWritten["co_all"] = 0;
+                foreach (var c in amd.Cores) _lastCo[c.Index] = 0;
+            } : null,
+            Note = $"One Curve Optimizer offset for every core, in counts ({-range} to +{range}; one count is roughly 3 to 5 mV). Negative undervolts. " +
+                   "Auto means the cores currently differ: open the Curve Optimizer window for the per-core values. Entering 0 sets every core to 0." + pboNote,
+            Available = live && msgs.HasCurveOptimizer
+        });
+    }
+
+    /// <summary>Per-core Curve Optimizer margin from the SMU, or what was last written here when the firmware cannot report it.</summary>
+    public int? ReadCurveOptimizer(AmdCore core)
+    {
+        if (Amd == null || !SmuAvailable) return null;
+        int? m = Amd.Smu.Messages.HasCurveOptimizerReadback ? Amd.Smu.ReadCurveOptimizer(core.Ccd, core.CoreInCcd) : null;
+        if (m is int v) return v;
+        return _lastCo.TryGetValue(core.Index, out int last) ? last : null;
+    }
+
+    public void ApplyCurveOptimizer(AmdCore core, int margin)
+    {
+        if (Amd == null || !SmuAvailable) throw new InvalidOperationException("SMU not available.");
+        Amd.Smu.SetCurveOptimizer(core.Ccd, core.CoreInCcd, margin);
+        _lastCo[core.Index] = margin;
+        int? rb = Amd.Smu.Messages.HasCurveOptimizerReadback ? Amd.Smu.ReadCurveOptimizer(core.Ccd, core.CoreInCcd) : null;
+        Emit($"Curve Optimizer {core.Label} ({core.Location}): set to {margin}" + (rb is int r ? $" (SMU reports {r})" : "") + ".");
+        if (rb is int r2 && r2 != margin) throw new IOException($"the SMU accepted {margin} but reports {r2}.");
+    }
+
+    // ------------------------------------------------------------------ shared rows
+    private void BuildBoardRails()
+    {
         // These have no CPU-side register at all: the motherboard's regulators produce them, and
         // the only way to set them is that board's own VRM protocol. Shown live, read-only, rather
         // than offered as a field that would silently do nothing.
-        if (SuperIo != null)
+        if (SuperIo == null) return;
+        var sio = SuperIo;
+        void AddBoardRail(string id, string name, int rail, string note)
         {
-            var sio = SuperIo;
-            void AddBoardRail(string id, string name, int rail, string note)
+            if (sio.ReadVoltage(rail) is not double v || v < 0.05) return;
+            Settings.Add(new Setting
             {
-                if (sio.ReadVoltage(rail) is not double v || v < 0.05) return;
-                Settings.Add(new Setting
-                {
-                    Id = id, Name = name, Group = SettingGroup.Board, Unit = "V", Min = 0, Max = 5, Decimals = 3,
-                    Read = () => sio.ReadVoltage(rail), Write = null, Note = note, Available = true
-                });
-            }
-            AddBoardRail("cpu_vdd2", "CPU VDD2 Voltage", Hardware.SuperIo.RailVdd2,
-                "Memory-controller input rail, measured at the board. It is produced by the motherboard VRM and has no CPU register, so it cannot be set from here - only from the BIOS or the board vendor's own tool.");
-            AddBoardRail("cpu_aux", "CPU AUX Voltage", Hardware.SuperIo.RailAux,
-                "CPU AUX (VCCIN AUX) rail, measured at the board. Board VRM only, same as VDD2: no CPU-side path to set it.");
+                Id = id, Name = name, Group = SettingGroup.Board, Unit = "V", Min = 0, Max = 5, Decimals = 3,
+                Read = () => sio.ReadVoltage(rail), Write = null, Note = note, Available = true
+            });
         }
+        AddBoardRail("cpu_vdd2", IsAmd ? "SoC / VDD2 Rail" : "CPU VDD2 Voltage", Hardware.SuperIo.RailVdd2,
+            "Measured at the board. It is produced by the motherboard VRM and has no CPU register, so it cannot be set from here - only from the BIOS or the board vendor's own tool.");
+        AddBoardRail("cpu_aux", "CPU AUX Voltage", Hardware.SuperIo.RailAux,
+            "CPU AUX rail, measured at the board. Board VRM only, same as VDD2: no CPU-side path to set it.");
+    }
 
-        // ---------------- DDR5 PMIC ----------------
+    private void BuildDimms()
+    {
         foreach (var d in Dimms)
         {
             var dimm = d;
@@ -271,7 +526,7 @@ public sealed class HardwareModel : IDisposable
                 Id = $"{dimm.SlotName.ToLowerInvariant()}_vddq", Name = $"DRAM {dimm.SlotName} VDDQ Voltage", Group = SettingGroup.Memory, Unit = "V",
                 Min = Ddr5Dimm.VddqMinV, Max = Ddr5Dimm.VddqMaxV, Decimals = 3,
                 Read = dimm.ReadVddq, Write = dimm.VddqVerified ? dimm.WriteVddq : null,
-                Note = "VDDQ set-point (PMIC SWC rail, 5 mV steps)." + (dimm.VddqVerified ? "" : unverified), Available = dimm.HasPmic
+                Note = $"VDDQ set-point (PMIC SWC rail), register step {(dimm.VddqVerified ? dimm.VddqStepMv + " mV" : "unknown")}." + (dimm.VddqVerified ? "" : unverified), Available = dimm.HasPmic
             });
             Settings.Add(new Setting
             {
@@ -425,43 +680,60 @@ public sealed class HardwareModel : IDisposable
     public LiveStatus ReadLive()
     {
         var st = new LiveStatus();
-        if (Cpu == null) return st;
-        try { st.PackageTempC = Cpu.ReadPackageTemperature(); } catch { }
-        try
-        {
-            var (ratio, vid) = Cpu.ReadPerfStatus(Cpu.FirstPThread);
-            st.CoreVid = vid;
-            st.CoreRatio = Math.Max(ratio, Cpu.ReadMaxCurrentPRatio());
-            st.CoreMHz = st.CoreRatio * (LastBclk ?? 100.0);
-        }
-        catch { }
-        try { st.RingRatio = Cpu.ReadCurrentRingRatio(); } catch { }
-        try
-        {
-            double e = Cpu.ReadPackageEnergyJoules();
-            var now = DateTime.UtcNow;
-            if (_lastEnergyAt != default)
-            {
-                double dt = (now - _lastEnergyAt).TotalSeconds;
-                double de = e - _lastEnergyJ;
-                if (de < 0) de += 4294967296.0 * (1.0 / 65536); // 32-bit wrap at the common 1/65536 J unit
-                if (dt > 0.2) st.PackageWatts = de / dt;
-            }
-            _lastEnergyJ = e; _lastEnergyAt = now;
-        }
-        catch { }
         st.BclkMHz = LastBclk;
         try { st.VcoreVrm = SuperIo?.ReadVcore(); } catch { }
+        if (Cpu != null)
+        {
+            try { st.PackageTempC = Cpu.ReadPackageTemperature(); } catch { }
+            try
+            {
+                var (ratio, vid) = Cpu.ReadPerfStatus(Cpu.FirstPThread);
+                st.CoreVid = vid;
+                st.CoreRatio = Math.Max(ratio, Cpu.ReadMaxCurrentPRatio());
+                st.CoreMHz = st.CoreRatio * (LastBclk ?? 100.0);
+            }
+            catch { }
+            try { st.RingRatio = Cpu.ReadCurrentRingRatio(); } catch { }
+            try { st.PackageWatts = PowerFromEnergy(Cpu.ReadPackageEnergyJoules()); } catch { }
+        }
+        else if (Amd != null)
+        {
+            try { st.PackageTempC = Amd.ReadTemperature() is double t ? (int)Math.Round(t) : null; } catch { }
+            try
+            {
+                double mhz = Amd.ReadMaxCoreMHz() * ((LastBclk ?? 100.0) / 100.0);
+                st.CoreMHz = mhz; st.CoreRatio = (int)Math.Round(mhz / 100.0);
+            }
+            catch { }
+            try { st.CoreVid = SmuAvailable && TableFresh() && Amd.Smu.VddcrCpu is float v && v > 0.2 ? Math.Round(v, 3) : Amd.ReadCoreVid(); } catch { }
+            try { st.PackageWatts = PowerFromEnergy(Amd.ReadPackageEnergyJoules()); } catch { }
+        }
         return st;
+    }
+
+    /// <summary>Package power from two RAPL energy counter samples; the first call only primes the counter.</summary>
+    private double? PowerFromEnergy(double joules)
+    {
+        var now = DateTime.UtcNow;
+        double? watts = null;
+        if (_lastEnergyAt != default)
+        {
+            double dt = (now - _lastEnergyAt).TotalSeconds;
+            double de = joules - _lastEnergyJ;
+            if (de < 0) de += 4294967296.0 * (1.0 / 65536); // 32-bit wrap at the common 1/65536 J unit
+            if (dt > 0.2) watts = de / dt;
+        }
+        _lastEnergyJ = joules; _lastEnergyAt = now;
+        return watts;
     }
 
     /// <summary>Blocking ~60 ms measurement; call from a background thread.</summary>
     public double? MeasureBclk()
     {
-        if (Bclk is not { IsAvailable: true } || Cpu == null || Cpu.BaseRatio == 0) return null;
+        if (Bclk is not { IsAvailable: true } || BaseRatio == 0) return null;
         try
         {
-            LastBclk = Bclk.MeasureBclkMHz(Cpu.BaseRatio);
+            LastBclk = Bclk.MeasureBclkMHz(BaseRatio);
             return LastBclk;
         }
         catch (Exception ex) { Emit("BCLK measure failed: " + ex.Message); return null; }
@@ -472,6 +744,7 @@ public sealed class HardwareModel : IDisposable
         SuperIo?.Dispose();
         Bclk?.Dispose();
         Smbus?.Dispose();
+        Amd?.Smu.Dispose();
         Driver?.Dispose();
     }
 }

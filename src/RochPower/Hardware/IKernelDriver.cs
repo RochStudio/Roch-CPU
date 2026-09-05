@@ -24,4 +24,10 @@ public interface IKernelDriver : IDisposable
     /// <summary>PCI configuration space read (legacy 256-byte space). Returns false if the device is absent.</summary>
     bool ReadPciConfig(byte bus, byte device, byte function, ushort offset, out uint value);
     bool WritePciConfig(byte bus, byte device, byte function, ushort offset, uint value);
+
+    /// <summary>
+    /// Reads physical memory into <paramref name="buffer"/>. Used for the AMD SMU power table,
+    /// which the SMU writes into a reserved DRAM window. Returns false if the driver refuses.
+    /// </summary>
+    bool ReadPhysicalMemory(ulong address, byte[] buffer);
 }

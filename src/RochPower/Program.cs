@@ -11,8 +11,23 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        // The diagnostic switches print to the console they were launched from; a WinExe has none of its own.
+        if (args.Length > 0) Native.AttachConsole(Native.ATTACH_PARENT_PROCESS);
+
         if (args.Length > 0 && args[0].Equals("--probe", StringComparison.OrdinalIgnoreCase))
             return Probe(args.Length > 1 ? args[1] : Path.Combine(AppContext.BaseDirectory, "probe.txt"));
+
+        if (args.Length > 0 && args[0].Equals("--pm-dump", StringComparison.OrdinalIgnoreCase))
+            return PmDump(args.Length > 1 ? args[1] : Path.Combine(AppContext.BaseDirectory, "pmtable.txt"));
+
+        if (args.Length > 2 && args[0].Equals("--smu", StringComparison.OrdinalIgnoreCase))
+            return SmuCommand(args.Skip(1).ToArray());
+
+        if (args.Length > 2 && args[0].Equals("--apply", StringComparison.OrdinalIgnoreCase))
+            return ApplySetting(args[1], args[2]);
+
+        if (args.Length > 1 && args[0].Equals("--smn", StringComparison.OrdinalIgnoreCase))
+            return SmnDump(args[1], args.Length > 2 ? int.Parse(args[2], CultureInfo.InvariantCulture) : 16);
 
         if (args.Length > 0 && args[0].Equals("--smb-regs", StringComparison.OrdinalIgnoreCase))
         {
@@ -77,7 +92,7 @@ internal static class Program
         void W(string s) { sb.AppendLine(s); Console.WriteLine(s); }
         using var hw = new HardwareModel();
         hw.Initialize();
-        var cpu = hw.Cpu!;
+        if (hw.Cpu is not { } cpu) { W("This test drives the Intel OC mailbox; not available on this CPU."); File.WriteAllText(reportPath, sb.ToString()); return 1; }
         var sio = hw.SuperIo;
         if (sio == null) { W("No Super I/O: cannot measure the real rail."); File.WriteAllText(reportPath, sb.ToString()); return 1; }
         var mb = cpu.Mailbox;
@@ -191,7 +206,7 @@ internal static class Program
         using var hw = new HardwareModel();
         hw.Log += m => W("  log: " + m);
         hw.Initialize();
-        var cpu = hw.Cpu!;
+        if (hw.Cpu is not { } cpu) { W("This test drives the Intel OC mailbox; not available on this CPU."); File.WriteAllText(reportPath, sb.ToString()); return 1; }
         var drv = hw.Driver!;
         int thread = cpu.FirstPThread;
 
@@ -333,6 +348,93 @@ internal static class Program
     }
 
     /// <summary>
+    /// Raw SMU mailbox transaction for research: --smu rsmu|mp1|hsmp 0xMSG [arg0 arg1 ...].
+    /// Prints the status and the six argument registers after the call. Anything sent here goes
+    /// straight to the firmware; know what the message does before using it.
+    /// </summary>
+    private static int SmuCommand(string[] a)
+    {
+        using var hw = new HardwareModel();
+        hw.Initialize();
+        if (hw.Amd is not { } amd || !hw.SmuAvailable) { Console.WriteLine("No AMD SMU."); return 1; }
+        static uint Parse(string s) => s.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? Convert.ToUInt32(s[2..], 16) : uint.Parse(s, CultureInfo.InvariantCulture);
+        var mb = a[0].ToLowerInvariant() switch { "rsmu" => amd.Smu.Messages.Rsmu, "mp1" => amd.Smu.Messages.Mp1, "hsmp" => amd.Smu.Messages.Hsmp, _ => null };
+        if (mb == null) { Console.WriteLine("mailbox must be rsmu, mp1 or hsmp"); return 1; }
+        uint msg = Parse(a[1]);
+        var margs = new uint[6];
+        for (int i = 2; i < a.Length && i - 2 < 6; i++) margs[i - 2] = Parse(a[i]);
+        var st = amd.Smu.Send(mb, msg, margs);
+        string line = $"{mb.Name} (msg 0x{mb.Msg:X8}) message 0x{msg:X}: {AmdSmu.Describe(st)} (0x{(byte)st:X2}); args = {string.Join(" ", margs.Select(x => $"0x{x:X8}"))}";
+        Console.WriteLine(line);
+        try { File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "smu.txt"), $"[{DateTime.Now:HH:mm:ss}] {line}{Environment.NewLine}"); } catch { }
+        return st == Hardware.SmuStatus.Ok ? 0 : 2;
+    }
+
+    /// <summary>Reads a run of SMN registers: --smn 0x73000 [count]. Prints hex and the SVI3 / SVI2 VID decodes, to smn.txt as well.</summary>
+    private static int SmnDump(string start, int count)
+    {
+        var sb = new StringBuilder();
+        void W(string m) { sb.AppendLine(m); Console.WriteLine(m); }
+        using var hw = new HardwareModel();
+        hw.Initialize();
+        if (hw.Amd is not { } amd) { W("No AMD CPU."); return 1; }
+        uint a0 = start.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? Convert.ToUInt32(start[2..], 16) : uint.Parse(start, CultureInfo.InvariantCulture);
+        for (int i = 0; i < count; i++)
+        {
+            uint a = a0 + (uint)(i * 4);
+            if (amd.Smu.ReadSmn(a) is uint v)
+            {
+                uint svi3 = (v >> 6) & 0x1FF, svi2 = v >> 24;
+                W($"0x{a:X8} = 0x{v:X8}  svi3[14:6]={svi3} -> {0.245 + svi3 * 0.005:0.000} V  svi3[24:16]={(v >> 16) & 0x1FF} -> {0.245 + ((v >> 16) & 0x1FF) * 0.005:0.000} V  svi2[31:24]={svi2} -> {1.55 - svi2 * 0.00625:0.000} V  low16={v & 0xFFFF}");
+            }
+            else W($"0x{a:X8} = read failed");
+        }
+        try { File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "smn.txt"), sb.ToString()); } catch { }
+        return 0;
+    }
+
+    /// <summary>Applies one row by id through the same path the window uses: --apply ppt 150. Logs to the console and apply.txt.</summary>
+    private static int ApplySetting(string id, string text)
+    {
+        var sb = new StringBuilder();
+        void W(string m) { sb.AppendLine(m); Console.WriteLine(m); }
+        using var hw = new HardwareModel();
+        hw.Log += m => W("  log: " + m);
+        hw.Initialize();
+        var s = hw.Settings.FirstOrDefault(x => x.Id.Equals(id, StringComparison.OrdinalIgnoreCase));
+        int rc;
+        if (s == null) { W($"no row '{id}'. Rows: {string.Join(", ", hw.Settings.Select(x => x.Id))}"); rc = 1; }
+        else if (!s.TryParse(text, out double v)) { W($"'{text}' is not a number"); rc = 1; }
+        else
+        {
+            W($"{s.Name}: before = {s.CurrentText} {s.Unit}");
+            bool ok = hw.Apply(s, v);
+            W($"{s.Name}: apply {(ok ? "OK" : "FAILED")}, now = {s.CurrentText} {s.Unit}");
+            rc = ok ? 0 : 2;
+        }
+        try { File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "apply.txt"), sb.ToString()); } catch { }
+        return rc;
+    }
+
+    /// <summary>Dumps the whole SMU power table as index / offset / float, for layout research on a new firmware.</summary>
+    private static int PmDump(string reportPath)
+    {
+        var sb = new StringBuilder();
+        using var hw = new HardwareModel();
+        hw.Log += m => sb.AppendLine("  log: " + m);
+        hw.Initialize();
+        if (hw.Amd is not { } amd || !hw.SmuAvailable) { sb.AppendLine("No AMD SMU."); File.WriteAllText(reportPath, sb.ToString()); return 1; }
+        var smu = amd.Smu;
+        sb.AppendLine($"{amd.BrandString} - {amd.CodeName}; SMU {smu.VersionText}; table v0x{smu.TableVersion:X8} at 0x{smu.TableAddress:X} size 0x{smu.TableSize:X}");
+        if (!smu.RefreshTable() || smu.Table is not { } t) { sb.AppendLine("table read failed: " + smu.LastTableError); File.WriteAllText(reportPath, sb.ToString()); return 1; }
+        sb.AppendLine("index  offset  value");
+        for (int i = 0; i < t.Length; i++) sb.AppendLine($"{i,5}  0x{i * 4:X4}  {t[i].ToString("0.####", CultureInfo.InvariantCulture)}");
+        File.WriteAllText(reportPath, sb.ToString());
+        Console.WriteLine($"wrote {t.Length} floats to {reportPath}");
+        return 0;
+    }
+
+    /// <summary>
     /// Headless self-test: initialises the hardware layer, reads everything, performs
     /// no-op rewrites (same value) to confirm the write paths are accepted, and writes a report.
     /// </summary>
@@ -382,6 +484,35 @@ internal static class Program
                     try { var s = cpu.Mailbox.ReadDomain(0); cpu.Mailbox.WriteDomain(0, s); W("  Mailbox dom 0 rewrite  : OK"); }
                     catch (Exception ex) { W("  Mailbox dom 0 rewrite  : " + ex.Message); }
                 }
+            }
+            if (hw.Amd is { } amd)
+            {
+                var smu = amd.Smu;
+                W($"CPU          : {amd.BrandString} family {amd.Family:X}h model {amd.Model:X2}h stepping {amd.Stepping} package type {amd.PackageType} - {amd.CodeName}, {amd.Generation}");
+                W($"Topology     : {amd.CoreCount} cores / {amd.LogicalCount} threads, {amd.ThreadsPerCore} threads per core, {amd.CcdCount} CCD(s); {amd.TopologyNote}");
+                W($"Cores        : " + string.Join("  ", amd.Cores.Select(c => $"{c.Label}={c.Location} thr[{string.Join(",", c.Threads)}] mask 0x{smu.CoreMask(c.Ccd, c.CoreInCcd):X8}")));
+                W($"P0 ratio     : {amd.BaseRatio}   microcode 0x{amd.PatchLevel:X8}");
+                W($"SMU          : {hw.SmuStatus}   OC caps {(hw.OcCapabilities is uint oc ? $"0x{oc:X}" : "n/a")}");
+                if (hw.SmuAvailable)
+                {
+                    var (fp, ft, fe) = smu.ReadStockLimits();
+                    W($"Stock limits : PPT {fp?.ToString("0") ?? "n/a"} W, TDC {ft?.ToString("0") ?? "n/a"} A, EDC {fe?.ToString("0") ?? "n/a"} A; sustained {(smu.ReadSustainedLimits() is { } sl ? $"{sl.power} W / {sl.temp} C" : "n/a")}");
+                    W($"Scalar       : {smu.ReadScalar()?.ToString("0.00") ?? "n/a"}   boost limit {smu.ReadBoostLimitMHz()?.ToString() ?? "n/a"} MHz");
+                    W($"Curve Opt.   : " + string.Join("  ", amd.Cores.Select(c => $"{c.Label}={(smu.ReadCurveOptimizer(c.Ccd, c.CoreInCcd)?.ToString() ?? "?")}")));
+                    W($"Table        : v0x{smu.TableVersion:X8} at 0x{smu.TableAddress:X} size 0x{smu.TableSize:X} layout {smu.Layout?.Name ?? "unknown"}");
+                    if (smu.RefreshTable() && smu.Table is { } t)
+                    {
+                        W($"  limits     : PPT {smu.PptLimit:0.##}/{smu.PptValue:0.##} W  TDC {smu.TdcLimit:0.##}/{smu.TdcValue:0.##} A  EDC {smu.EdcLimit:0.##}/{smu.EdcValue:0.##} A  THM {smu.ThmLimit:0.##} C  socket {smu.SocketPower:0.##} W  VDDCR {smu.VddcrCpu:0.###} V");
+                        var line = new StringBuilder("  table[0..63]:");
+                        for (int i = 0; i < Math.Min(64, t.Length); i++) { if (i % 8 == 0) line.Append($"\n    {i,3}:"); line.Append($" {t[i],10:0.###}"); }
+                        W(line.ToString());
+                    }
+                    else W("  table read failed: " + smu.LastTableError);
+                }
+                W($"Temperature  : {amd.ReadTemperature()?.ToString("0.0") ?? "n/a"} C   VID {amd.ReadCoreVid()?.ToString("0.000") ?? "n/a"} V   max core {amd.ReadMaxCoreMHz():0} MHz");
+                W($"BCLK         : {hw.MeasureBclk()?.ToString("0.000", CultureInfo.InvariantCulture) ?? "n/a"} MHz ({hw.Bclk?.Status})");
+                var live = hw.ReadLive(); Thread.Sleep(500); live = hw.ReadLive();
+                W($"Live         : {live.PackageTempC} C, {live.CoreMHz:0.0} MHz, VID {live.CoreVid:0.000} V, {live.PackageWatts:0.0} W");
             }
             W("");
             W($"SMBus        : {hw.SmbusStatus}");

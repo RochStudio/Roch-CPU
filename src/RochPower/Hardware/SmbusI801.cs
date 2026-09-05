@@ -4,7 +4,7 @@ namespace RochPower.Hardware;
 /// Intel PCH SMBus host controller (the i801 family: bus 0, device 31, function 4)
 /// driven through I/O ports. Used to reach the DDR5 SPD hubs and PMICs on the DIMMs.
 /// </summary>
-public sealed class SmbusI801 : IDisposable
+public sealed class SmbusI801 : ISmbus
 {
     private const byte Bus = 0, Device = 31, Function = 4;
 
@@ -28,6 +28,7 @@ public sealed class SmbusI801 : IDisposable
 
     public ushort BaseAddress => _base;
     public uint PciId { get; }
+    public string Description => $"PCH SMBus 0x{PciId >> 16:X4} at I/O 0x{_base:X4}";
 
     private SmbusI801(IKernelDriver drv, ushort baseAddr, uint pciId)
     {

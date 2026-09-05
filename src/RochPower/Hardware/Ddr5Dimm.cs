@@ -2,8 +2,8 @@ namespace RochPower.Hardware;
 
 /// <summary>
 /// One DDR5 DIMM: its SPD5118 hub (0x50 + slot) and its on-module PMIC (0x48 + slot).
-/// Voltages are set on the PMIC itself, so this works on any board whose PCH SMBus
-/// reaches the DIMM slots. It does not depend on the motherboard VRM controller.
+/// Voltages are set on the PMIC itself, so this works on any board whose SMBus controller
+/// (Intel PCH or AMD FCH) reaches the DIMM slots. It does not depend on the motherboard VRM.
 ///
 /// Register scales differ between PMICs (the VDD rail on overclocking kits uses a
 /// 10 mV step instead of the JEDEC 5 mV step). Because a wrong scale on a write could
@@ -22,7 +22,7 @@ public sealed class Ddr5Dimm
     public const byte R_SWD_PWR = 0x0F;
     public const byte R_SWA_VOUT = 0x21;    // VDD  : bits 7:1, 800 mV base, 5 or 10 mV per step (calibrated)
     public const byte R_SWB_VOUT = 0x23;    // VDD second phase (0 = follows SWA)
-    public const byte R_SWC_VOUT = 0x25;    // VDDQ : bits 7:1, 800 mV base, 5 mV per step
+    public const byte R_SWC_VOUT = 0x25;    // VDDQ : bits 7:1, 800 mV base, 5 or 10 mV per step (calibrated)
     public const byte R_SWD_VOUT = 0x27;    // VPP  : bits 7:1, 1500 mV base, 5 mV per step
     public const byte R_ADC_ENABLE = 0x30;  // bit 7 = enable, bits 6:3 = input select
     public const byte R_ADC_READ = 0x31;
@@ -36,10 +36,10 @@ public sealed class Ddr5Dimm
     private const double CalibrationToleranceV = 0.060; // ADC accuracy + ripple
 
     public const double VddMinV = 0.800, VddMaxV = 1.800;
-    public const double VddqMinV = 0.800, VddqMaxV = 1.435;
+    public const double VddqMinV = 0.800, VddqMaxV = 1.500;
     public const double VppMinV = 1.500, VppMaxV = 2.135;
 
-    private readonly SmbusI801 _bus;
+    private readonly ISmbus _bus;
     public int Slot { get; }
     public string SlotName { get; }
     public byte SpdAddress => (byte)(SpdBase + Slot);
@@ -50,19 +50,25 @@ public sealed class Ddr5Dimm
     /// <summary>mV per register step of the VDD (SWA) rail; 0 until calibrated.</summary>
     public int VddStepMv { get; private set; }
     public bool VddVerified => VddStepMv != 0;
-    public bool VddqVerified { get; private set; }
+    /// <summary>
+    /// mV per register step of the VDDQ (SWC) rail; 0 until calibrated. JEDEC says 5 mV, but the
+    /// PMIC on a G.Skill DDR5-6000 kit (vendor 8A12) decodes to 1.120 V at 5 mV while its ADC and
+    /// HWiNFO both read 1.440 V: a 10 mV step, like the VDD rail on overclocking kits.
+    /// </summary>
+    public int VddqStepMv { get; private set; }
+    public bool VddqVerified => VddqStepMv != 0;
     public bool VppVerified { get; private set; }
     public bool AdcWritable { get; private set; }
     public string CalibrationNote { get; private set; } = "not calibrated";
 
-    public Ddr5Dimm(SmbusI801 bus, int slot)
+    public Ddr5Dimm(ISmbus bus, int slot)
     {
         _bus = bus; Slot = slot;
         SlotName = slot switch { 0 => "DIMMA1", 1 => "DIMMA2", 2 => "DIMMB1", 3 => "DIMMB2", _ => $"DIMM{slot}" };
     }
 
     /// <summary>Probe all four slots; a DIMM is present when its SPD5118 hub answers with device type 0x51.</summary>
-    public static List<Ddr5Dimm> Probe(SmbusI801 bus)
+    public static List<Ddr5Dimm> Probe(ISmbus bus)
     {
         var list = new List<Ddr5Dimm>();
         for (int s = 0; s < 4; s++)
@@ -106,7 +112,7 @@ public sealed class Ddr5Dimm
     /// <summary>Compares each rail's register decode with the ADC and records which scales are trustworthy.</summary>
     public void Calibrate()
     {
-        VddStepMv = 0; VddqVerified = false; VppVerified = false; AdcWritable = false;
+        VddStepMv = 0; VddqStepMv = 0; VppVerified = false; AdcWritable = false;
         if (!HasPmic) { CalibrationNote = "no PMIC"; return; }
         double? adcA = ReadAdcVolts(ADC_SWA), adcC = ReadAdcVolts(ADC_SWC), adcD = ReadAdcVolts(ADC_SWD);
         if (adcA is null || adcC is null || adcD is null)
@@ -125,10 +131,13 @@ public sealed class Ddr5Dimm
         bool m10 = Math.Abs(vdd10 - adcA.Value) <= CalibrationToleranceV;
         if (m5 && !m10) VddStepMv = 5;
         else if (m10 && !m5) VddStepMv = 10;
-        VddqVerified = Math.Abs(Decode(rc, 800, 5) - adcC.Value) <= CalibrationToleranceV;
+        bool q5 = Math.Abs(Decode(rc, 800, 5) - adcC.Value) <= CalibrationToleranceV;
+        bool q10 = Math.Abs(Decode(rc, 800, 10) - adcC.Value) <= CalibrationToleranceV;
+        if (q5 && !q10) VddqStepMv = 5;
+        else if (q10 && !q5) VddqStepMv = 10;
         VppVerified = Math.Abs(Decode(rd, 1500, 5) - adcD.Value) <= CalibrationToleranceV;
         CalibrationNote = $"ADC: VDD {adcA:0.000} V, VDDQ {adcC:0.000} V, VPP {adcD:0.000} V -> " +
-                          $"VDD step {(VddVerified ? VddStepMv + " mV" : "unknown")}, VDDQ {(VddqVerified ? "ok" : "mismatch")}, VPP {(VppVerified ? "ok" : "mismatch")}";
+                          $"VDD step {(VddVerified ? VddStepMv + " mV" : "unknown")}, VDDQ step {(VddqVerified ? VddqStepMv + " mV" : "unknown")}, VPP {(VppVerified ? "ok" : "mismatch")}";
     }
 
     private static double Decode(byte raw, int baseMv, int stepMv) => (baseMv + stepMv * (raw >> 1)) / 1000.0;
@@ -141,7 +150,7 @@ public sealed class Ddr5Dimm
     // ---------------------------------------------------------------- reads
     /// <summary>VDD set-point. Uses the calibrated step; falls back to the 5 mV JEDEC decode when unverified.</summary>
     public double? ReadVdd() => ReadRail(R_SWA_VOUT, 800, VddVerified ? VddStepMv : 5);
-    public double? ReadVddq() => ReadRail(R_SWC_VOUT, 800, 5);
+    public double? ReadVddq() => ReadRail(R_SWC_VOUT, 800, VddqVerified ? VddqStepMv : 5);
     public double? ReadVpp() => ReadRail(R_SWD_VOUT, 1500, 5);
 
     /// <summary>Power draw per rail in mW (SWA+SWB = VDD, SWC = VDDQ, SWD = VPP); null when not reported.</summary>
@@ -190,8 +199,8 @@ public sealed class Ddr5Dimm
     {
         if (!VddqVerified) throw new InvalidOperationException($"{SlotName}: VDDQ scale not verified against the PMIC ADC; write refused for safety.");
         if (volts < VddqMinV || volts > VddqMaxV) throw new ArgumentOutOfRangeException(nameof(volts), $"VDDQ must be {VddqMinV:0.000}-{VddqMaxV:0.000} V.");
-        byte v = Encode(volts, 800, 5);
-        WriteRail(R_SWC_VOUT, v, "VDDQ", ADC_SWC, Decode(v, 800, 5));
+        byte v = Encode(volts, 800, VddqStepMv);
+        WriteRail(R_SWC_VOUT, v, "VDDQ", ADC_SWC, Decode(v, 800, VddqStepMv));
     }
 
     public void WriteVpp(double volts)

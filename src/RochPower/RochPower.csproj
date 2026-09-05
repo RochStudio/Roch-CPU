@@ -20,7 +20,7 @@
     <FileVersion>1.0.0.0</FileVersion>
     <Product>Roch CPU</Product>
     <Company>Roch Studio</Company>
-    <Copyright>Roch Studio - open CPU tuning for LGA1700</Copyright>
+    <Copyright>Roch Studio - open CPU tuning for LGA1700 and AMD Ryzen</Copyright>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <InvariantGlobalization>true</InvariantGlobalization>
@@ -28,6 +28,8 @@
 
   <ItemGroup>
     <None Include="..\..\drivers\WinRing0x64.sys" Link="WinRing0x64.sys" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\drivers\pawnio\RyzenSMU.bin" Link="pawnio\RyzenSMU.bin" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\drivers\pawnio\LICENSE-LGPL-2.1.txt" Link="pawnio\LICENSE-LGPL-2.1.txt" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\..\README.md" Link="README.md" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\..\assets\RochCPU.ico" Link="RochCPU.ico" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\..\assets\mark.png" Link="mark.png" CopyToOutputDirectory="PreserveNewest" />

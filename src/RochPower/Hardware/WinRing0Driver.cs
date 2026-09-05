@@ -21,6 +21,7 @@ public sealed unsafe class WinRing0Driver : IKernelDriver
     private const uint FILE_ANY_ACCESS = 0, FILE_READ_ACCESS = 1, FILE_WRITE_ACCESS = 2;
 
     private static readonly uint IOCTL_GET_DRIVER_VERSION = CtlCode(0x800, FILE_ANY_ACCESS);
+    private static readonly uint IOCTL_GET_REFCOUNT = CtlCode(0x801, FILE_ANY_ACCESS);
     private static readonly uint IOCTL_READ_MSR = CtlCode(0x821, FILE_ANY_ACCESS);
     private static readonly uint IOCTL_WRITE_MSR = CtlCode(0x822, FILE_ANY_ACCESS);
     private static readonly uint IOCTL_READ_IO_PORT_BYTE = CtlCode(0x833, FILE_READ_ACCESS);
@@ -31,6 +32,7 @@ public sealed unsafe class WinRing0Driver : IKernelDriver
     private static readonly uint IOCTL_WRITE_IO_PORT_DWORD = CtlCode(0x838, FILE_WRITE_ACCESS);
     private static readonly uint IOCTL_READ_PCI_CONFIG = CtlCode(0x851, FILE_READ_ACCESS);
     private static readonly uint IOCTL_WRITE_PCI_CONFIG = CtlCode(0x852, FILE_WRITE_ACCESS);
+    private static readonly uint IOCTL_READ_MEMORY = CtlCode(0x841, FILE_READ_ACCESS);
 
     private SafeFileHandle? _handle;
     private bool _installedByUs;
@@ -151,6 +153,19 @@ public sealed unsafe class WinRing0Driver : IKernelDriver
         return version;
     }
 
+    /// <summary>
+    /// How many handles the driver has open, ours included. WinRing0's device name is the same for
+    /// every program that uses it, so another tool (an older ZenStates-Core build, a monitoring
+    /// utility) may have opened the device this service created. Stopping the service under it
+    /// leaves the driver in STOP_PENDING with the device unusable for everyone until that tool
+    /// exits, which is exactly what happened on the bench; so the refcount is checked before a stop.
+    /// </summary>
+    public uint GetRefCount()
+    {
+        uint n = 0;
+        return Ioctl(IOCTL_GET_REFCOUNT, null, 0, &n, 4) ? n : 0;
+    }
+
     // ------------------------------------------------------------------ MSR
     public bool ReadMsr(uint index, out ulong value, int cpu = -1)
     {
@@ -226,6 +241,22 @@ public sealed unsafe class WinRing0Driver : IKernelDriver
         return Ioctl(IOCTL_WRITE_PCI_CONFIG, &input, (uint)sizeof(WritePciInput), null, 0);
     }
 
+    // ------------------------------------------------------------ physical memory
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    private struct ReadMemoryInput { public ulong Address; public uint UnitSize; public uint Count; }
+
+    /// <summary>
+    /// OLS_READ_MEMORY: the driver maps the physical range and copies it out. This is how every
+    /// AMD monitoring tool reads the SMU power table; it never writes.
+    /// </summary>
+    public bool ReadPhysicalMemory(ulong address, byte[] buffer)
+    {
+        if (buffer.Length == 0) return true;
+        var input = new ReadMemoryInput { Address = address, UnitSize = 1, Count = (uint)buffer.Length };
+        fixed (byte* p = buffer)
+            return Ioctl(IOCTL_READ_MEMORY, &input, (uint)sizeof(ReadMemoryInput), p, (uint)buffer.Length);
+    }
+
     // ------------------------------------------------------------- plumbing
     private bool Ioctl(uint code, void* input, uint inSize, void* output, uint outSize)
     {
@@ -254,11 +285,13 @@ public sealed unsafe class WinRing0Driver : IKernelDriver
 
     public void Dispose()
     {
+        uint others = IsOpen ? Math.Max(GetRefCount(), 1) - 1 : 0;
         _handle?.Dispose();
         _handle = null;
         if (!_installedByUs) return;
         _installedByUs = false;
         if (!IsOnlyInstance()) return; // another copy started while we ran; leave the driver loaded
+        if (others > 0) return;        // another program opened our device; stopping now would strand it
         IntPtr scm = Native.OpenSCManager(null, null, Native.SC_MANAGER_ALL_ACCESS);
         if (scm == IntPtr.Zero) return;
         try

@@ -10,4 +10,7 @@ vcore.txt
 sio.txt
 smbus.txt
 vtest.txt
+smu.txt
+apply.txt
+pmtable.txt
 *.bin

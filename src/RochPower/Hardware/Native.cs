@@ -85,6 +85,11 @@ internal static class Native
     [DllImport("advapi32.dll", SetLastError = true)]
     public static extern bool CloseServiceHandle(IntPtr hSCObject);
 
+    // ---- Console (diagnostic command-line modes) ----
+    public const int ATTACH_PARENT_PROCESS = -1;
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool AttachConsole(int dwProcessId);
+
     // ---- Global hot keys ----
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);

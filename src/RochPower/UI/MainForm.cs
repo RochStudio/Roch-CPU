@@ -23,6 +23,8 @@ public sealed class MainForm : Form
     private readonly Button _btnPerCore = Theme.Button("Per-Core Ratio Table");
     private readonly Button _btnAuto = Theme.Button("Start");
     private TextBox _txtAutoStep = null!, _txtAutoInterval = null!;
+    private TableLayoutPanel _toolRow = null!;
+    private FlowLayoutPanel _autoPanel = null!;
 
     // rows
     private readonly TableLayoutPanel _rows = new() { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 1, BackColor = Theme.Bg };
@@ -77,7 +79,7 @@ public sealed class MainForm : Form
         var mark = Theme.LoadMark(20);
         if (mark != null) brand.Controls.Add(new PictureBox { Image = mark, Size = new Size(20, 20), Margin = new Padding(0, 5, 6, 0), BackColor = Color.Transparent });
         var roch = Theme.Label("Roch", Theme.Brand, Theme.Accent); roch.Margin = new Padding(0, 6, 0, 0);
-        var cpu = Theme.Label("CPU", Theme.Brand, Theme.Text); cpu.Margin = new Padding(4, 6, 0, 0);
+        var cpu = Theme.Label($"CPU {AppVersion}", Theme.Brand, Theme.Text); cpu.Margin = new Padding(4, 6, 0, 0);
         brand.Controls.Add(roch); brand.Controls.Add(cpu);
         title.Controls.Add(brand);
         var btnClose = Theme.TitleButton("", close: true);
@@ -122,14 +124,14 @@ public sealed class MainForm : Form
         _body.Controls.Add(header, 0, 0);
 
         // tools: per-core table + auto ratio stepper
-        var toolRow = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = false, Height = 72, ColumnCount = 1, RowCount = 2, BackColor = Theme.Bg, Margin = new Padding(0, 8, 0, 4) };
+        var toolRow = _toolRow = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = false, Height = 72, ColumnCount = 1, RowCount = 2, BackColor = Theme.Bg, Margin = new Padding(0, 8, 0, 4) };
         toolRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         toolRow.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
         toolRow.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
         _btnPerCore.Dock = DockStyle.Top; _btnPerCore.AutoSize = false; _btnPerCore.Height = 30; _btnPerCore.Font = Theme.Bold; _btnPerCore.Margin = new Padding(0, 0, 0, 6);
         _btnPerCore.Click += (_, _) => OpenPerCore();
         toolRow.Controls.Add(_btnPerCore, 0, 0);
-        var auto = new FlowLayoutPanel { AutoSize = false, Height = 32, Dock = DockStyle.Top, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, BackColor = Color.Transparent, Margin = new Padding(0) };
+        var auto = _autoPanel = new FlowLayoutPanel { AutoSize = false, Height = 32, Dock = DockStyle.Top, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, BackColor = Color.Transparent, Margin = new Padding(0) };
         var autoLbl = Theme.Label("Auto ratio step", Theme.Row); autoLbl.Margin = new Padding(0, 4, 8, 0);
         auto.Controls.Add(autoLbl);
         auto.Controls.Add(Theme.ValueBox(out _txtAutoStep, 44)); _txtAutoStep.Text = "1";
@@ -201,8 +203,11 @@ public sealed class MainForm : Form
                 last = s.Group;
                 _rows.Controls.Add(Theme.SectionTitle(s.Group switch
                 {
-                    SettingGroup.Clocks => "Clocks", SettingGroup.Voltages => "Voltages (FIVR / OC mailbox)", SettingGroup.Power => "Power limits",
-                    SettingGroup.Memory => "DDR5 memory (PMIC)", SettingGroup.Board => "Board VRM rails (measured, read-only)", _ => ""
+                    SettingGroup.Clocks => "Clocks", SettingGroup.Voltages => "Voltages (FIVR / OC mailbox)",
+                    SettingGroup.Power => _hw.IsAmd ? "Power and current limits (SMU)" : "Power limits",
+                    SettingGroup.Pbo => "Precision Boost Overdrive (SMU)",
+                    SettingGroup.Memory => "DDR5 memory (PMIC)",
+                    SettingGroup.Board => "Board VRM rails (measured, read-only)", _ => ""
                 }));
             }
 
@@ -222,7 +227,7 @@ public sealed class MainForm : Form
             box.Text = s.CurrentText;
             box.Enabled = !s.ReadOnly;
             box.Tag = s;
-            var unit = Theme.Muted_(s.Unit); unit.Margin = new Padding(4, 6, 0, 0); unit.Width = 26; unit.AutoSize = false;
+            var unit = Theme.Muted_(s.Unit); unit.Margin = new Padding(4, 6, 0, 0); unit.Width = 34; unit.AutoSize = false;
 
             row.Controls.Add(name, 0, 0);
             row.Controls.Add(range, 1, 0);
@@ -276,14 +281,10 @@ public sealed class MainForm : Form
         finally { Cursor = Cursors.Default; }
 
         var sm = _hw.Smbios;
-        if (_hw.Cpu is { } cpu)
+        if (_hw.Cpu != null || _hw.Amd != null)
         {
-            _lblCpu.Text = cpu.BrandString;
-            int threads = cpu.LogicalCpus.Count;
-            string cores = cpu.ECoreCount > 0
-                ? $"{cpu.PCoreCount}P + {cpu.ECoreCount}E cores, {threads} threads"
-                : $"{cpu.PCoreCount} cores, {threads} threads";
-            _lblCores.Text = $"{cores}  ·  {cpu.Generation}";
+            _lblCpu.Text = _hw.CpuName;
+            _lblCores.Text = _hw.CpuGeneration.Length > 0 ? $"{_hw.CoreSummary}  ·  {_hw.CpuGeneration}" : _hw.CoreSummary;
         }
         else
         {
@@ -291,19 +292,30 @@ public sealed class MainForm : Form
             _lblCores.Text = _hw.DriverStatus;
         }
         _lblBoard.Text = sm.MainboardModel;
-        _lblBios.Text = $"BIOS {sm.BiosVersion}" + (sm.BiosDate.Length > 0 ? $"  ·  {sm.BiosDate}" : "");
+        _lblBios.Text = $"BIOS {sm.BiosVersion}";
 
         var warns = new List<string>();
         if (_hw.Driver == null) warns.Add("kernel driver not loaded, nothing can be read or written (see Log)");
         if (_hw.OcLocked) warns.Add("BIOS OC Lock set: ratio and voltage writes will be rejected");
         if (_hw.Cpu != null && !_hw.MailboxAvailable) warns.Add("OC mailbox not responding: voltage rows disabled");
         if (_hw.Cpu is { IsLga1700Family: false }) warns.Add("not a known LGA1700 CPU");
+        if (_hw.Amd is { IsSupported: false }) warns.Add("unknown Zen generation: SMU message numbers assumed");
+        if (_hw.Amd != null && !_hw.SmuAvailable) warns.Add("SMU not responding: PBO rows disabled (see Log)");
+        if (_hw.Amd != null && _hw.SmuAvailable && !_hw.PboAllowed) warns.Add("SMU reports PBO unavailable: enable Precision Boost Overdrive in the BIOS or writes will be rejected");
         if (_hw.BiosCoreOverride) warns.Add("BIOS core voltage is in Override mode: on boards that pin the VRM there, CPU Core Voltage changes only the VID. Use Adaptive/Auto in BIOS.");
         _lblWarn.Text = string.Join("  ·  ", warns);
         _lblWarn.Visible = warns.Count > 0;
 
         BuildRows();
-        _btnPerCore.Enabled = _hw.Cpu != null;
+        if (_hw.IsAmd)
+        {
+            _btnPerCore.Text = "Curve Optimizer (per core)";
+            _btnPerCore.Enabled = _hw.SmuAvailable && _hw.Amd!.Smu.Messages.HasCurveOptimizer;
+            // The ratio stepper drives the Intel turbo table; nothing on the SMU side steps safely on a timer.
+            _autoPanel.Visible = false;
+            _toolRow.Height = 38;
+        }
+        else _btnPerCore.Enabled = _hw.Cpu != null;
         SetStatus($"Ready  ·  {_hw.DriverStatus}", false);
 
         _autoTimer.Tick += (_, _) => AutoTick();
@@ -401,6 +413,9 @@ public sealed class MainForm : Form
             "core_off" or "ecore_off" or "ring_off" or "sa_off" or "gt_off" => value > 150,
             _ when s.Id.EndsWith("_vdd") || s.Id.EndsWith("_vddq") => value > 1.40,
             _ when s.Id.EndsWith("_vpp") => value > 1.95,
+            "ppt" => value > 500,
+            "tdc" or "edc" => value > 800,
+            "co_all" => value > 15,
             _ => false
         };
         if (!risky) return true;
@@ -423,6 +438,13 @@ public sealed class MainForm : Form
     // ------------------------------------------------------------------ per core / auto
     private void OpenPerCore()
     {
+        if (_hw.Amd != null)
+        {
+            using var co = new CurveOptimizerForm(_hw);
+            co.ShowDialog(this);
+            RefreshRows();
+            return;
+        }
         if (_hw.Cpu == null) return;
         using var f = new PerCoreForm(_hw);
         f.ShowDialog(this);

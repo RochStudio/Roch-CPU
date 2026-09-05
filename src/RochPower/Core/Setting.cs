@@ -2,7 +2,7 @@ using System.Globalization;
 
 namespace RochPower.Core;
 
-public enum SettingGroup { Clocks, Voltages, Power, Memory, Board }
+public enum SettingGroup { Clocks, Voltages, Power, Pbo, Memory, Board }
 
 /// <summary>One tunable row in the main window.</summary>
 public sealed class Setting

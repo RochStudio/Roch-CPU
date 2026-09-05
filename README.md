@@ -3,7 +3,9 @@
 # Roch CPU
 
 Board-independent CPU and memory tuning for **Intel LGA1700** (12th / 13th / 14th Gen Core on
-any Z690 / Z790 / B660 / B760 / H670 / H770 board). The third Roch Studio tool, next to
+any Z690 / Z790 / B660 / B760 / H670 / H770 board) and **AMD Ryzen** (Zen 2 to Zen 5 on AM4 /
+AM5: PPT / TDC / EDC, thermal limit, PBO scalar, Curve Optimizer, FMax, DDR5 voltages). The
+third Roch Studio tool, next to
 [Roch GPU](https://github.com/RochStudio/Roch-GPU) and
 [Roch Viewer](https://github.com/RochStudio/Roch-Viewer), and built in the same shape:
 one dark window, typeable values, a log.
@@ -12,7 +14,10 @@ It started as a re-creation of MSI Dragon Power that does not need an MSI board.
 Power talks to MSI-specific VRM controllers; Roch CPU only uses interfaces that every
 LGA1700 CPU and every Intel 600/700-series chipset expose the same way.
 
-<img src="screenshot.png" alt="Roch CPU main window" width="430">
+<p>
+<img src="screenshot.png" alt="Roch CPU on Intel" width="430">
+<img src="screenshot-amd.png" alt="Roch CPU on AMD" width="430">
+</p>
 
 > Writing ratios and voltages can crash the machine, corrupt work in progress, and in the
 > extreme damage hardware. Nothing here persists across a reboot, but a bad value applied
@@ -102,6 +107,79 @@ rail did not, the row is marked **board ignored it**, the apply counts as failed
 says why. It also reads the mailbox at start-up and warns in the header when the BIOS left the
 core voltage in Override mode.
 
+## AMD Ryzen
+
+On an AMD CPU the window swaps the Intel rows for the ones the SMU (the System Management
+Unit, the firmware that runs Precision Boost) understands. Every one of them is a message to
+the SMU mailbox, which is what Ryzen Master, ZenStates and the BIOS itself use, so it does not
+care who made the board.
+
+| Control | Path | Notes |
+|---|---|---|
+| PPT, TDC, EDC | RSMU `SetPPTLimit` / `SetTDCVDDLimit` / `SetEDCVDDLimit`, MP1 fallback; read back from the SMU power table when [PawnIO](https://pawnio.eu) is installed | PBO must be enabled in the BIOS or the SMU rejects the write (the log says *rejected: prerequisite not met*). Without PawnIO the rows start as *Auto*; see below. |
+| Thermal limit (Tctl max) | RSMU `SetTctlMax` | the temperature the boost algorithm holds the CPU to |
+| PBO scalar | RSMU `SetPBOScalar`, read back with `GetPBOScalar` | 1x to 10x |
+| Curve Optimizer, all cores | RSMU / MP1 `SetAllDldoPsmMargin` | -30..+30 before Zen 4, -50..+50 from Zen 4 |
+| Curve Optimizer, per core | `SetDldoPsmMargin` with the core's CCD / core address, read back with `GetDldoPsmMargin` | the **Curve Optimizer** button; cores are numbered the way the SMU (and the BIOS) number them, from the fuse map, so a 6-core CCD skips its two disabled positions |
+| FMax | RSMU `GetBoostLimitFrequency` / `SetBoostLimitFrequencyAllCores` | the all-core boost ceiling; Zen 4 and later |
+| DDR5 VDD / VDDQ / VPP per DIMM | the PMIC on each module over the FCH SMBus | same as Intel, see below |
+| Temperature, VID, clocks, package power, SoC-side voltages, FCLK / UCLK / MCLK | SMN thermal block, SVI3 telemetry, HW P-state MSR, RAPL MSRs, SMU power table | shown by `--probe` only. The SoC rails and the memory clocks are BIOS settings the SMU has no message to change, so they are not offered as rows. The Super I/O rails shown on Intel are hidden on AMD, where the board's channel map is not known. |
+| Base clock | measured, TSC against the ACPI timer, using the P0 multiplier | read-only |
+
+The SMU is reached through the SMN index/data pair in the north bridge's PCI configuration
+space (D0F0 0x60 / 0x64) under the same `Global\Access_PCI` mutex HWiNFO, Ryzen Master and
+ZenStates take, so Roch CPU can run beside them. Message numbers and mailbox addresses per
+generation come from ZenStates-Core (see the notices file); nothing was copied, and the
+numbers this build was tested against are marked as such in the source.
+
+**Reading the limits back needs PawnIO.** There is no SMU message that reports the PPT / TDC /
+EDC limit currently in force. Every tool that shows it reads the *power table* the SMU
+publishes in DRAM, and that needs a driver that can map arbitrary physical memory. The
+WinRing0 build every monitoring tool ships (and this one bundles) was compiled without that
+support: it answers *invalid parameter* for any address outside the BIOS ROM window. So Roch
+CPU does what ZenStates does: if [PawnIO](https://pawnio.eu) (namazso's signed, sandboxed
+driver, also used by LibreHardwareMonitor and HWiNFO) is installed, it loads the signed
+`RyzenSMU` module shipped in `pawnio/` and reads the table through it, and the limit rows show
+the real numbers, including what the BIOS set. Roch CPU never installs PawnIO itself. Without
+it the log says so, the limit rows start as **Auto** (meaning: whatever the BIOS set) and show
+the value you last wrote from here.
+
+Three RSMU messages do answer without PawnIO, with the CPU's *stock* limits - on a Ryzen 7
+9850X3D `0xD9` / `0xDB` / `0xDC` return 162 W / 120 A / 180 A, which are that part's PPT /
+TDC / EDC - and writing 150 W then reading again still gives 162, so they are fuses, not
+read-back. They are what **0** writes on those rows. (ZenStates labels the same three messages
+*fused power / VDD TDC / SoC TDC*; the values on this CPU say otherwise.)
+
+The table layout is not the same across generations. The Zen 5 (table 0x0062xxxx) offsets used
+here were found by writing distinctive limits and watching which floats followed; after every
+limit write Roch CPU checks the same thing again and switches the read-back off, saying so in
+the log, if the float it expected did not move.
+
+Two more things measured rather than assumed: the fused limits and the Set messages both use
+milliwatts / milliamperes, and the HSMP mailbox is dead on desktop parts (it never becomes
+ready), so it is only reachable from the raw `--smu hsmp` switch.
+
+Supported: Matisse / Vermeer / Raphael / Granite Ridge and their Threadripper and EPYC
+siblings, Zen / Zen+ with fewer rows, and the Renoir-to-Strix APUs with the message numbers
+ZenStates uses for them (untested here). An unknown Zen generation is reported in the header
+and nothing is written until the SMU answers the test message.
+
+DDR5 VDD / VDDQ / VPP work on AMD the same way as on Intel: the PMIC on each DIMM, reached over
+the FCH's PIIX4-compatible SMBus controller at I/O 0xB00 (`Hardware/SmbusPiix4.cs`), with the same
+ADC calibration and the same refusal to write a rail whose register scale could not be confirmed.
+The FCH can route that controller to several physical ports through a mux in its PM MMIO block;
+switching it needs an MMIO write WinRing0 cannot do, so Roch CPU uses whichever port the BIOS
+left selected. On the B850MPOWER the DIMMs are on it. The G.Skill kit there also showed that VDDQ
+is not always the JEDEC 5 mV per step: its PMIC (vendor 8A12) uses 10 mV, which the calibration
+now detects for VDDQ exactly as it did for VDD.
+
+Diagnostics: `--probe` prints the topology with each core's SMU address, the SMU firmware
+version, stock limits, scalar, boost limit and every core's Curve Optimizer value;
+`--smu rsmu|mp1|hsmp 0xMSG [args]` sends one raw mailbox message and prints the six argument
+registers (research only, it goes straight to the firmware); `--apply <row> <value>` applies
+one row through the same path the window uses; `--pm-dump` dumps the power table if a future
+driver can read it.
+
 ## Boards
 
 Everything except the rail measurement is a CPU or Intel-chipset feature, so it does not care
@@ -129,6 +207,8 @@ prints every channel if you want to check one.
   self-contained (below).
 * `WinRing0x64.sys` beside the executable; the build copies it. This is the OpenLibSys
   WinRing0 1.2 driver used by OpenHardwareMonitor, Fan Control and others.
+* On AMD, optionally [PawnIO](https://pawnio.eu) for PPT / TDC / EDC read-back (see the AMD
+  section). Everything else works without it.
   * Windows **Memory Integrity (Core Isolation)** or the vulnerable-driver blocklist may
     refuse to load it. The window then shows a warning and every row reads N/A.
   * Defender sometimes flags WinRing0 as a *HackTool*. It is a plain MSR / port-I/O driver;
@@ -159,7 +239,8 @@ Or directly: `dotnet publish src/RochPower -c Release -o dist`.
 ```
 
 writes a report with every register the tool relies on (topology, turbo tables, mailbox
-domains, PL1/PL2, BCLK, SMBus, DIMM PMIC registers, the ADC calibration) plus no-op write
+domains, PL1/PL2, BCLK, SMBus, DIMM PMIC registers, the ADC calibration; on AMD the SMU
+firmware, stock limits, scalar, boost limit and Curve Optimizer values) plus no-op write
 checks that rewrite the current values. Attach it when reporting a board that misbehaves.
 
 `--vtest report.txt` goes one step further: it nudges the core voltage by 10–40 mV and the
@@ -182,12 +263,14 @@ named EC registers. Use them when porting to a board with a different sensor chi
   scrolls. Controls this system does not have are hidden rather than greyed out, which is why
   the E-core rows disappear when E-cores are off.
 * **0** in any field restores the value captured when Roch CPU started; a voltage override
-  goes back to *Auto* (adaptive).
+  goes back to *Auto* (adaptive). On AMD, PPT / TDC / EDC cannot be read at start-up, so **0**
+  writes the CPU's stock limit instead, and **0** on a Curve Optimizer row sets every core to 0.
 * **Revert** re-reads the hardware into the fields. **Reset** writes the start-up values back.
-* **Per-Core Ratio Table** opens the turbo table: the multiplier allowed for 1, 2, … N active
-  P-cores and for each E-core group.
-* **Auto ratio step** raises the CPU ratio by *step* every *interval* seconds until a write is
-  rejected or you press Stop (F6). Run a stress test beside it to find the limit.
+* **Per-Core Ratio Table** (Intel) opens the turbo table: the multiplier allowed for 1, 2, … N
+  active P-cores and for each E-core group. **Curve Optimizer** (AMD) opens the per-core
+  offset table, read back from the SMU.
+* **Auto ratio step** (Intel) raises the CPU ratio by *step* every *interval* seconds until a
+  write is rejected or you press Stop (F6). Run a stress test beside it to find the limit.
 * **Log** opens the log window, which explains every failure: a locked MSR, a value the mailbox
   rejected, a PMIC in secure mode, an SMBus hidden by the BIOS, a driver Windows would not load.
 
@@ -208,10 +291,10 @@ The status line under the buttons says what the last Apply did.
 ## Layout
 
 ```
-src/RochPower/Hardware   driver client (WinRing0), MSR/CPU, OC mailbox, PCH SMBus, DDR5 PMIC, SMBIOS, BCLK meter
-src/RochPower/Core       settings model, hardware model
-src/RochPower/UI         theme, main window, per-core dialog, log window
-drivers/                 WinRing0x64.sys (signed, extracted from LibreHardwareMonitorLib 0.9.4)
+src/RochPower/Hardware   driver client (WinRing0), Intel MSR/CPU + OC mailbox, AMD CPU + SMU mailbox, PCH SMBus, DDR5 PMIC, SMBIOS, BCLK meter
+src/RochPower/Core       settings model, hardware model (picks the Intel or AMD rows)
+src/RochPower/UI         theme, main window, per-core ratio dialog (Intel), Curve Optimizer dialog (AMD), log window
+drivers/                 WinRing0x64.sys (signed, extracted from LibreHardwareMonitorLib 0.9.4); pawnio/RyzenSMU.bin (signed PawnIO module, optional)
 assets/                  the Roch mark, icon
 ```
 
@@ -224,3 +307,8 @@ MSI Z790MPOWER (BIOS P.90) with an i5-14600KF and a DDR5 kit at 1.470 / 1.410 / 
 Every reading was cross-checked against MSI Dragon Power on the same machine. Two things that
 came out of that: the OC mailbox's SA voltage lives in domain 4 on Raptor Lake (documentation
 usually says 3), and the VDD register scale above.
+
+MSI B850MPOWER (BIOS 1.A21) with a Ryzen 7 9850X3D (Granite Ridge, SMU 0.98.83). The Curve
+Optimizer read-back matched the values ZenStates showed on the same machine, the SMU accepted
+every limit / scalar / boost-limit write and echoed it, and the stock-limit and power-table
+findings above were measured there.

@@ -17,7 +17,9 @@ executable by the build.
 Notes for anyone auditing this: WinRing0 is a general-purpose low-level access driver, which is
 why security software sometimes flags it, and why Windows Memory Integrity (Core Isolation) or
 the Microsoft vulnerable-driver blocklist may refuse to load it. It contains no exploit code.
-Roch CPU installs it as a demand-start service and removes it again on exit.
+Roch CPU installs it as a demand-start service and removes it again on exit. This build of the
+driver was compiled without `_PHYSICAL_MEMORY_SUPPORT`: its read-memory call only maps the
+BIOS ROM window (0xC0000-0xFFFFF), which is why the AMD SMU power table cannot be read.
 
 ## LibreHardwareMonitor
 
@@ -30,6 +32,39 @@ access sequences were used as reference and reimplemented.
 Where this project's measurements disagreed with that reference, the measurement won and the
 difference is documented in the source — for example the CPU AUX channel on MSI's NCT6687D
 needs the same x2 input divider as VDD2, which the generic map does not apply.
+
+## PawnIO and the RyzenSMU module (`drivers/pawnio/RyzenSMU.bin`)
+
+On AMD, if the user has installed namazso's [PawnIO](https://pawnio.eu) driver, Roch CPU loads
+the `RyzenSMU` module from [PawnIO.Modules](https://github.com/namazso/PawnIO.Modules) into it
+to read the SMU power table, which WinRing0 cannot. The module is shipped as the signed binary
+from the PawnIO.Modules 0.2.4 release (the same blob ZenStates-Core embeds), unmodified.
+
+* Copyright (C) 2025 namazso. Licensed **LGPL-2.1-or-later**; the licence text is beside it.
+* SHA-256: `B84ECA7F32C63B3D8C14B2C6D45482706DF8683AA6F43EB8BEAD9DC62181D38F`
+* PawnIO itself is not bundled and is never installed by Roch CPU.
+
+The client in `Hardware/PawnIo.cs` follows the ioctl layout of LibreHardwareMonitor's and
+ZenStates-Core's PawnIO wrappers (32-byte function name followed by 64-bit arguments).
+
+## ZenStates-Core, ZenStates, SMUDebugTool
+
+The AMD path talks to the SMU the way Ivan Rusanov's
+[ZenStates-Core](https://github.com/irusanov/ZenStates-Core) (GPL-3.0, the library behind
+[ZenStates](https://github.com/irusanov/ZenStates) and
+[SMUDebugTool](https://github.com/irusanov/SMUDebugTool)) does: the RSMU / MP1 / HSMP mailbox
+addresses per generation, the message numbers, the core-address encoding for the Curve
+Optimizer and the fuse registers that give the CCD and core map were taken from it as
+reference and reimplemented in `Hardware/AmdSmu.cs` and `Hardware/AmdCpu.cs`. No ZenStates
+code is included. Roch CPU is itself GPL-3.0, so the two are licence-compatible either way.
+
+Where this project's measurements disagreed with the reference, the measurement won and the
+difference is documented in the source: the three "fused limit" messages on Zen 4 / Zen 5
+return the CPU's stock PPT / TDC / EDC rather than the power / VDD TDC / SoC TDC ZenStates names
+them, and they do not track a written limit.
+
+The SMN index/data access and the Global\Access_PCI mutex convention follow the
+[ryzen_smu](https://gitlab.com/leogx9r/ryzen_smu) Linux driver and LibreHardwareMonitor.
 
 ## MSI Dragon Power
 
