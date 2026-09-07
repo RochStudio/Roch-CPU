@@ -17,10 +17,14 @@ and CPU VDD2: those live on hardware the board's embedded controller owns, they 
 through that controller's mailbox, and so far that mailbox is only mapped on MSI's Nuvoton EC
 parts. Everything else works with or without it.
 
-<p>
-<img src="screenshot.png" alt="Roch CPU on Intel" width="430">
-<img src="screenshot-amd.png" alt="Roch CPU on AMD" width="430">
+<p align="center">
+<img src="screenshot.png" alt="Roch CPU on an Intel LGA1700 board" height="600">
+&nbsp;&nbsp;
+<img src="screenshot-amd.png" alt="Roch CPU on an AMD AM5 board" height="600">
 </p>
+
+<p align="center"><sub>The same window on Intel and on AMD. The rows follow the CPU: OC mailbox
+voltages and board rails on one, the SMU's limits and Curve Optimizer on the other.</sub></p>
 
 ## What's new in 1.0.1
 
@@ -47,7 +51,7 @@ parts. Everything else works with or without it.
 | CPU ratio (all-core, plus the per-active-core-count table) | MSR 0x1AD / 0x1AE | boards with an unlocked multiplier (Z-series + K CPU). Non-Z boards set *OC Lock* and the writes are rejected; the window says so. |
 | E-core ratio | MSR 0x650 | same |
 | Ring ratio | OC mailbox ring domain + MSR 0x620 (the MSR alone is ignored on Alder/Raptor Lake) | same |
-| Core / E-core L2 / Ring / SA / GT voltage, offset or static override | Intel OC mailbox (MSR 0x150) through the CPU's own SVID path | every board unless the BIOS disables the mailbox or sets *Undervolt Protection*. The VRM must be following SVID: with the BIOS core voltage in **Override** mode, MSI boards fix the VRM output and a VID change from here goes nowhere; use **Adaptive** or **Auto** in the BIOS (see below) |
+| Core / E-core L2 / Ring / SA / GT voltage, offset or static override | Intel OC mailbox (MSR 0x150) through the CPU's own SVID path. On Raptor Lake SA is domain 4 and E-core L2 is domain 5, both established by measurement; published tables commonly put them at 3, which reads a rail nobody set. The E-core L2 rail exists and is settable even with the E-cores switched off in the BIOS | every board unless the BIOS disables the mailbox or sets *Undervolt Protection*. The VRM must be following SVID: with the BIOS core voltage in **Override** mode, MSI boards fix the VRM output and a VID change from here goes nowhere; use **Adaptive** or **Auto** in the BIOS (see below) |
 | PL1 / PL2 package power limits | MSR 0x610 | every board unless locked in BIOS |
 | DDR5 VDD / VDDQ / VPP per DIMM | the PMIC on each module over the PCH SMBus | any board whose BIOS leaves the SMBus visible; vendor-locked (*secure mode*) PMICs read but refuse writes |
 | Base clock | the board's clock generator, over the mailbox in the embedded controller; measured by counting core cycles against the ACPI timer | MSI 600/700-series boards with a Nuvoton EC. Elsewhere it is read-only. Capped at 102.5 MHz (see below) |
@@ -375,22 +379,3 @@ assets/                  the Roch mark, icon
 
 `IKernelDriver` is the only thing the rest of the code talks to, so another ring-0 backend
 (PawnIO, a vendor driver) can be dropped in without touching the UI.
-
-## Validated on
-
-MSI Z790MPOWER (BIOS P.90) with an i5-14600KF and a DDR5 kit at 1.470 / 1.410 / 1.800 V.
-Every reading was cross-checked against MSI Dragon Power on the same machine. Four things came out
-of that, all of them cases where the measurement disagreed with the documentation or with the
-obvious reading and the measurement won:
-
-* The OC mailbox's **SA voltage lives in domain 4** on Raptor Lake; published tables usually say 3.
-* **E-core L2 is domain 5**, not 3. The rail exists and is settable even with the E-cores switched
-  off in the BIOS, so that row is not gated on the core count.
-* The **DDR5 VDD register scale** above: 10 mV per step on overclocking kits, not the JEDEC 5 mV.
-* The **base clock is a divider**, so its register runs backwards against frequency — and both of
-  the obvious ways to measure the result are blind to a change.
-
-MSI B850MPOWER (BIOS 1.A21) with a Ryzen 7 9850X3D (Granite Ridge, SMU 0.98.83). The Curve
-Optimizer read-back matched the values ZenStates showed on the same machine, the SMU accepted
-every limit / scalar / boost-limit write and echoed it, and the stock-limit and power-table
-findings above were measured there.
