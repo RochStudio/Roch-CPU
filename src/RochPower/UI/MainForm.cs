@@ -40,6 +40,8 @@ public sealed class MainForm : Form
     private readonly System.Windows.Forms.Timer _autoTimer = new();
     private readonly System.Windows.Forms.Timer _slowRefresh = new() { Interval = 3000 };
     private bool _bclkBusy;
+    /// <summary>Set while an apply is running on a worker, so nothing else touches the hardware.</summary>
+    private bool _applying;
     private int _rowIndex;
 
     public MainForm()
@@ -348,6 +350,14 @@ public sealed class MainForm : Form
 
     private void OnClosing(object? sender, FormClosingEventArgs e)
     {
+        // Disposing the driver mid-apply could leave the base clock on an intermediate value with
+        // nothing left to put it back. An apply is short; ask again in a moment.
+        if (_applying)
+        {
+            e.Cancel = true;
+            SetStatus("Still applying - closing once it finishes.", false);
+            return;
+        }
         _slowRefresh.Stop();
         _autoTimer.Stop();
         _logForm.AllowClose = true;
@@ -375,7 +385,7 @@ public sealed class MainForm : Form
 
     private void SlowTick()
     {
-        if (_hw.Cpu == null) return;
+        if (_hw.Cpu == null || _applying) return;
         if (!_bclkBusy)
         {
             _bclkBusy = true;
@@ -400,9 +410,22 @@ public sealed class MainForm : Form
         if (message != null) { AppendLog(message); SetStatus(message, false); }
     }
 
+    /// <summary>
+    /// Parses and confirms on the UI thread, then does the hardware writes on a worker so the
+    /// window stays live. A base-clock change measures the clock after every step and so takes a
+    /// second or two; doing that inline froze the window for the whole apply.
+    ///
+    /// The slow refresh is stopped for the duration. It is not only that its repaint would fight
+    /// the row updates: it measures the base clock on its own worker, and two overlapping
+    /// measurements share the same fixed counters, which would make a step look like it had
+    /// missed and trigger a needless restore.
+    /// </summary>
     private void ApplyAll()
     {
-        int applied = 0, failed = 0;
+        if (_applying) return;
+
+        var work = new List<(Setting Setting, TextBox Box, double Value)>();
+        int failed = 0;
         foreach (var (s, box) in _boxes)
         {
             if (s.ReadOnly) continue;
@@ -410,15 +433,55 @@ public sealed class MainForm : Form
             if (text.Length == 0 || text.Equals(s.CurrentText, StringComparison.OrdinalIgnoreCase)) continue;
             if (!s.TryParse(text, out double value)) { AppendLog($"{s.Name}: '{text}' is not a number."); failed++; SetRowStatus(s, "invalid", Theme.Danger); continue; }
             if (value != 0 && !ConfirmDangerous(s, value)) { SetRowStatus(s, "skipped", Theme.Muted); continue; }
-            bool ok = _hw.Apply(s, value);
-            bool ignored = ok && s.Id is "core_v" or "core_off" && _hw.CoreVoltageIgnored;
-            if (ok && !ignored) applied++; else failed++;
-            SetRowStatus(s, ignored ? "board ignored it" : ok ? "applied" : "failed", ok && !ignored ? Theme.Ok : Theme.Danger);
-            box.Text = s.CurrentText;
+            work.Add((s, box, value));
         }
-        if (applied == 0 && failed == 0) { SetStatus("Nothing to apply: no field differs from the hardware.", false); return; }
-        SetStatus($"Applied at {DateTime.Now:HH:mm:ss}  ·  {applied} ok, {failed} failed", failed > 0);
-        AppendLog($"Apply: {applied} applied, {failed} failed.");
+
+        if (work.Count == 0)
+        {
+            if (failed == 0) SetStatus("Nothing to apply: no field differs from the hardware.", false);
+            else SetStatus($"Applied at {DateTime.Now:HH:mm:ss}  ·  0 ok, {failed} failed", true);
+            return;
+        }
+
+        _applying = true;
+        _slowRefresh.Stop();
+        SetApplyEnabled(false);
+        SetStatus("Applying...", false);
+
+        int preFailed = failed;
+        Task.Run(() =>
+        {
+            // A base-clock measurement started by the last refresh may still be in flight, and it
+            // owns the same fixed counters the apply is about to measure with. Let it finish.
+            for (int i = 0; i < 40 && _bclkBusy; i++) Thread.Sleep(25);
+
+            int applied = 0, hwFailed = preFailed;
+            foreach (var (s, box, value) in work)
+            {
+                bool ok = _hw.Apply(s, value);
+                bool ignored = ok && s.Id is "core_v" or "core_off" && _hw.CoreVoltageIgnored;
+                if (ok && !ignored) applied++; else hwFailed++;
+                BeginInvoke(() =>
+                {
+                    SetRowStatus(s, ignored ? "board ignored it" : ok ? "applied" : "failed", ok && !ignored ? Theme.Ok : Theme.Danger);
+                    box.Text = s.CurrentText;
+                });
+            }
+            BeginInvoke(() =>
+            {
+                SetStatus($"Applied at {DateTime.Now:HH:mm:ss}  ·  {applied} ok, {hwFailed} failed", hwFailed > 0);
+                AppendLog($"Apply: {applied} applied, {hwFailed} failed.");
+                SetApplyEnabled(true);
+                _applying = false;
+                _slowRefresh.Start();
+            });
+        });
+    }
+
+    private void SetApplyEnabled(bool on)
+    {
+        _btnApply.Enabled = on; _btnRevert.Enabled = on; _btnReset.Enabled = on;
+        _btnApply.Text = on ? "Apply" : "Applying...";
     }
 
     private bool ConfirmDangerous(Setting s, double value)
@@ -481,6 +544,7 @@ public sealed class MainForm : Form
 
     private void AutoTick()
     {
+        if (_applying) return; // an apply is on a worker; do not write from here as well
         var s = _hw.Settings.FirstOrDefault(x => x.Id == "cpu_ratio");
         if (s == null || !s.Available || s.ReadOnly || s.Current is not double cur) { ToggleAuto(); return; }
         double.TryParse(_txtAutoStep.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double step);

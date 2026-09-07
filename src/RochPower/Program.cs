@@ -334,8 +334,8 @@ internal static class Program
 
             if (args.Length < 2 || !double.TryParse(args[1], System.Globalization.CultureInfo.InvariantCulture, out double want))
             { Console.WriteLine("usage: --bclk-set <MHz>"); return 1; }
-            if (!ctl.Calibrate(Console.WriteLine)) { Console.WriteLine("FAILED: " + ctl.Status); return 1; }
-            Console.WriteLine("calibrated: " + ctl.Status);
+            // No pre-calibration: SetBclk establishes the scale from its own first read, the same
+            // way the Base Clock row does, so this measures what the application actually costs.
             bool set = ctl.SetBclk(want, Console.WriteLine);
             Console.WriteLine((set ? "ok: " : "FAILED: ") + ctl.Status);
             return set ? 0 : 1;

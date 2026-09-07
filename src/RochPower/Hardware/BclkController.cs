@@ -29,8 +29,16 @@ public sealed class BclkController
     /// <summary>Floor. Below this the machine is uselessly slow and the meter gets noisy.</summary>
     public const double MinBclkMHz = 97.0;
 
-    /// <summary>Largest single change, in MHz.</summary>
-    public const double MaxStepMHz = 0.25;
+    /// <summary>
+    /// Largest single change, in MHz. The divider latches all at once, so this is not about
+    /// avoiding a half-applied value - it is about not asking the PLL for a big jump, and about
+    /// bounding how far a wrong model could take the clock before the check after the step
+    /// notices and puts everything back.
+    /// </summary>
+    public const double MaxStepMHz = 0.5;
+
+    /// <summary>How long to let the PLL settle after a write before measuring.</summary>
+    private const int SettleMs = 60;
 
     /// <summary>
     /// How far a step may land from where it was aimed before the change is treated as failed.
@@ -134,11 +142,33 @@ public sealed class BclkController
 
     // ---------------------------------------------------------------- calibration
     /// <summary>
-    /// Measures the oscillator on this board. The divider is known exactly - it is just the block
-    /// - so one measurement gives <c>Fvco = f * D</c>; a second point at a different divider then
-    /// confirms the relation really is a division rather than something that merely looked like
-    /// one over a short span. The probe moves the clock down, which is the safe direction, and the
-    /// block is put back either way.
+    /// Establishes the oscillator from a single measurement. The divider is known exactly - it is
+    /// just the block - so <c>Fvco = f * D</c> needs nothing else, and this costs one read and one
+    /// measurement rather than a write-probe-restore round trip.
+    ///
+    /// It deliberately does not confirm the model by moving the clock. <see cref="SetBclk"/>
+    /// checks every step against a measurement and restores on any mismatch, so a wrong scale is
+    /// caught on the first step having moved the clock by at most <see cref="MaxStepMHz"/> - the
+    /// same protection the probe gave, without making every apply wait for it.
+    /// </summary>
+    public bool EstablishScale(byte[] block, double mhz, Action<string>? log = null)
+    {
+        double divider = DividerOf(block);
+        if (divider < 1 || mhz < MinBclkMHz - 5 || mhz > MaxBclkMHz + 5)
+        { Status = $"implausible starting point ({mhz:0.000} MHz at divider {divider:0.000})"; return false; }
+        VcoMHz = mhz * divider;
+        Calibrated = true;
+        log?.Invoke($"  {mhz:0.000} MHz at divider {divider:0.000000} -> oscillator {VcoMHz:0.0} MHz");
+        Status = $"oscillator {VcoMHz:0.0} MHz, range {MinBclkMHz:0.0}-{MaxBclkMHz:0.0} MHz";
+        return true;
+    }
+
+    /// <summary>
+    /// Establishes the oscillator and then confirms it by moving the clock to a second divider,
+    /// so the relation is shown to be a division rather than something that merely looked like one
+    /// over a short span. This is the diagnostic form; the apply path uses
+    /// <see cref="EstablishScale"/> and leans on its per-step check instead. The probe moves the
+    /// clock down, which is the safe direction, and the block is put back either way.
     /// </summary>
     public bool Calibrate(Action<string>? log = null)
     {
@@ -146,9 +176,8 @@ public sealed class BclkController
         var start = Baseline!;
 
         if (Measure(4) is not double startMhz) { Status = "could not measure the base clock"; return false; }
-        double startDiv = DividerOf(start);
-        double vco = startMhz * startDiv;
-        log?.Invoke($"  baseline {startMhz:0.000} MHz at divider {startDiv:0.000000} -> oscillator {vco:0.0} MHz");
+        if (!EstablishScale(start, startMhz, log)) return false;
+        double vco = VcoMHz;
 
         // A quarter of a MHz slower: a bigger divider. Comfortably above the noise, and downwards
         // so that a wrong model costs speed rather than stability.
@@ -225,25 +254,30 @@ public sealed class BclkController
     /// </summary>
     public bool SetBclk(double targetMhz, Action<string>? log = null)
     {
-        if (!Calibrated && !Calibrate(log)) return false;
         double clamped = Clamp(targetMhz);
         if (Math.Abs(clamped - targetMhz) > 0.0005)
             log?.Invoke($"  {targetMhz:0.000} MHz is outside {MinBclkMHz:0.0}-{MaxBclkMHz:0.0}; using {clamped:0.000}");
 
+        // One read and one measurement serve both as the starting point and, the first time, as
+        // the whole of the calibration.
         if (Read() is not { } cur) { Status = "clock generator did not answer"; return false; }
         byte[] block = cur.Block;
         double mhz = cur.Mhz;
+        if (!Calibrated && !EstablishScale(block, mhz, log)) return false;
 
         int guard = 0;
         while (Math.Abs(clamped - mhz) > ToleranceMHz / 2 && guard++ < 40)
         {
             double next = mhz + Math.Clamp(clamped - mhz, -MaxStepMHz, MaxStepMHz);
             var attempt = BlockFor(block, DividerForMhz(next));
+            bool last = Math.Abs(next - clamped) <= ToleranceMHz / 2;
 
             if (!WriteSafely(attempt)) { Status = "write failed"; Restore(); return false; }
-            Thread.Sleep(150);
+            Thread.Sleep(SettleMs);
 
-            if (Measure(3) is not double got)
+            // Intermediate steps only have to show the clock is tracking; the one that lands on
+            // the target gets the more careful reading.
+            if (Measure(last ? 3 : 2) is not double got)
             { Status = "could not measure after the write"; Restore(); return false; }
             log?.Invoke($"  aimed {next:0.000} -> measured {got:0.000} MHz");
 
