@@ -15,9 +15,9 @@
     <RootNamespace>RochPower</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>..\..\assets\RochCPU.ico</ApplicationIcon>
-    <Version>1.0.0</Version>
-    <AssemblyVersion>1.0.0.0</AssemblyVersion>
-    <FileVersion>1.0.0.0</FileVersion>
+    <Version>1.0.1</Version>
+    <AssemblyVersion>1.0.1.0</AssemblyVersion>
+    <FileVersion>1.0.1.0</FileVersion>
     <Product>Roch CPU</Product>
     <Company>Roch Studio</Company>
     <Copyright>Roch Studio - open CPU tuning for LGA1700 and AMD Ryzen</Copyright>

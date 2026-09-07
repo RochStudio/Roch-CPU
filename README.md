@@ -10,14 +10,31 @@ third Roch Studio tool, next to
 [Roch Viewer](https://github.com/RochStudio/Roch-Viewer), and built in the same shape:
 one dark window, typeable values, a log.
 
-It started as a re-creation of MSI Dragon Power that does not need an MSI board. Dragon
-Power talks to MSI-specific VRM controllers; Roch CPU only uses interfaces that every
-LGA1700 CPU and every Intel 600/700-series chipset expose the same way.
+It started as a re-creation of MSI Dragon Power that does not need an MSI board. Almost
+everything it does uses interfaces every LGA1700 CPU and every Intel 600/700-series chipset
+expose the same way, so it does not care who made the board. The two exceptions are base clock
+and CPU VDD2: those live on hardware the board's embedded controller owns, they are reached
+through that controller's mailbox, and so far that mailbox is only mapped on MSI's Nuvoton EC
+parts. Everything else works with or without it.
 
 <p>
 <img src="screenshot.png" alt="Roch CPU on Intel" width="430">
 <img src="screenshot-amd.png" alt="Roch CPU on AMD" width="430">
 </p>
+
+## What's new in 1.0.1
+
+* **Base clock is settable** on MSI 600/700-series boards, through the clock generator on the EC's
+  I2C bus, capped at 102.5 MHz and measured after every step.
+* **CPU VDD2 is settable** on the same boards, through the board regulator, clamped to 1.100–1.450 V
+  and measured at the rail after every step.
+* Apply and Reset run off the UI thread, so the window stays live while a change is measured.
+* The mailbox voltage rows are re-read as the window refreshes, instead of once at start-up — a
+  single bad read at launch used to sit on screen for the life of the process.
+* The title bar's close and minimise buttons are visible again (they were being drawn with no
+  glyph at all), on a grey bar.
+* `--help` lists the diagnostic switches. The EC probes that could hang the board are gone, along
+  with the base-clock diagnostics written against a reading of the EC that turned out to be wrong.
 
 > Writing ratios and voltages can crash the machine, corrupt work in progress, and in the
 > extreme damage hardware. Nothing here persists across a reboot, but a bad value applied
@@ -33,18 +50,19 @@ LGA1700 CPU and every Intel 600/700-series chipset expose the same way.
 | Core / E-core L2 / Ring / SA / GT voltage, offset or static override | Intel OC mailbox (MSR 0x150) through the CPU's own SVID path | every board unless the BIOS disables the mailbox or sets *Undervolt Protection*. The VRM must be following SVID: with the BIOS core voltage in **Override** mode, MSI boards fix the VRM output and a VID change from here goes nowhere; use **Adaptive** or **Auto** in the BIOS (see below) |
 | PL1 / PL2 package power limits | MSR 0x610 | every board unless locked in BIOS |
 | DDR5 VDD / VDDQ / VPP per DIMM | the PMIC on each module over the PCH SMBus | any board whose BIOS leaves the SMBus visible; vendor-locked (*secure mode*) PMICs read but refuse writes |
-| Base clock | measured, TSC against the ACPI timer | read-only everywhere (see below) |
+| Base clock | the board's clock generator, over the mailbox in the embedded controller; measured by counting core cycles against the ACPI timer | MSI 600/700-series boards with a Nuvoton EC. Elsewhere it is read-only. Capped at 102.5 MHz (see below) |
 | Temperature, VID, clock, package power, DRAM rail power | MSRs / PMIC | every board |
 | Measured Vcore, used to check that a core-voltage apply actually reached the rail | Super I/O over LPC: Nuvoton NCT6683/6686/6687, Nuvoton NCT679x, or ITE IT86xx/87xx | boards carrying one of those chips; on anything else the check is skipped and the tool still runs |
-| CPU VDD2 and CPU AUX, live values | Nuvoton NCT6687D over LPC | read-only, and only on the MSI EC parts where the channel mapping is verified. See below for why these two cannot be set |
+| CPU VDD2, the memory controller's supply | the board's regulator, over the same EC mailbox; measured at the Super I/O | MSI 600/700-series boards with a Nuvoton EC. Clamped to 1.100-1.450 V |
+| CPU AUX, live value | Nuvoton NCT6687D over LPC | read-only; only on the MSI EC parts where the channel mapping is verified (see below) |
 
-Board-specific VRM rails that Dragon Power *sets* (CPU VDD2, CPU 1.05, CPU AUX, PCH 0.82)
-cannot be set here: they are produced by the motherboard's voltage regulators and have no
-CPU-side register at all, so writing them means driving that board's specific VRM controller.
-They are shown as live read-only values instead, straight from the Super I/O. BCLK is
-read-only for the same kind of reason; programming it goes through the Intel ICC firmware
-interface that MSI wraps in its proprietary `IccSdk.dll`. The measured value is the real one:
-an MSI board that displays 100.01 in Dragon Power runs at 99.84.
+Base clock and CPU VDD2 do not come from the CPU at all: one is a synthesiser on the board,
+the other a voltage regulator, and both sit on an I2C bus the embedded controller owns rather
+than on the PCH SMBus. Roch CPU reaches them through the mailbox that EC exposes — see
+[Base clock and CPU VDD2](#base-clock-and-cpu-vdd2). The other board rails Dragon Power sets
+(CPU 1.05, CPU AUX, PCH 0.82) are almost certainly on the same bus, but which device and
+register carry them has not been established, so they stay read-only: this does not write a
+regulator it has not verified.
 
 ### Two ways to set a CPU voltage, and why only one of them is portable
 
@@ -63,29 +81,25 @@ Intel one (every call has `n_` and `b_` variants) and takes a mutex named
 `Access_SMBUS.HTP.Renesas.Method`, which names the VRM controller family it drives. So Dragon
 Power is not doing something Roch CPU does badly, it is doing a different, board-specific thing.
 
-That private path was chased as far as it can be observed from outside the driver, on a
-Z790MPOWER with Dragon Power driven under automation while every visible bus was diffed:
+That private path was chased on a Z790MPOWER, and the first attempt got it wrong in an
+instructive way. The regulator does not answer on the PCH SMBus — dumping all 256 registers of
+every device that acknowledges, before and after a Vcore change, shows movement only in the DDR5
+PMIC's own sensor bytes — but the Nuvoton EC's register `0x470` *did* hold the new set-point every
+time, as a signed millivolt byte for Vcore and as `(mV - 1100) / 10` for VDD2. One slot holding two
+different encodings looked like a shared command parameter, and writing it was accepted, read back,
+and did nothing. That was recorded as a dead end.
 
-* The regulator does not answer on the PCH SMBus. Dumping all 256 registers of every device
-  that acknowledges, before and after a Vcore change, shows movement only in the DDR5 PMIC's
-  own sensor bytes.
-* The Nuvoton EC does mirror the set-point: `0x470` holds the offset from the BIOS Vcore as a
-  signed millivolt byte (1.250 V reads `0xE2` = −30, 1.350 V reads `70`). But it is only a
-  mirror. Writing it, with or without the `0x471` enable byte and with a clean 0→5 transition,
-  is accepted and reads back, and the rail does not move.
-* Nothing else in the EC's whole 256-page space tracks the set-point.
-* **CPU VDD2 and CPU AUX go the same way.** Driving Dragon Power's VDD2 field under automation
-  and diffing the EC shows VDD2 landing in that *same* `0x470` slot, but with a different
-  encoding: `(mV - 1100) / 10` (1.400 V reads 30, 1.440 V reads 34, 1.480 V reads 38), against
-  Vcore's 1 mV/LSB from 1280. One slot, two encodings, means `0x470` is a shared command
-  parameter and the rail identity travels separately. Writing it with the correct VDD2 encoding
-  is accepted and reads back, and the rail stays put — the same dead end as Vcore.
+It was not a mirror. `0x470` is the **write-data register of an I2C mailbox** the EC exposes, which
+is why the value appears there and why writing it alone does nothing: no target and no doorbell.
+Finding that out needed the vendor tool's own driver: its exported entry points were forwarded
+through a logging proxy and its port-level traffic recorded while it changed things. The bus is
+real, it is reachable, and Roch CPU now uses it — see below.
 
-So the write leaves through MSI's kernel driver on a bus that is not visible from either the
-PCH SMBus or the Super I/O. Replicating it means reverse-engineering that driver's protocol
-and then writing a VR controller whose register map and encoding would be guesswork. Roch CPU
-does not do that: a wrong register on an unverified regulator puts an arbitrary voltage into
-the CPU, and there is no read-back that would catch it before the damage.
+Vcore is the one rail on it that Roch CPU still will not write. It does not need to: with the BIOS
+in Adaptive mode the OC mailbox controls it exactly, and the CPU-side path is portable to boards
+this has never seen. Writing a VR controller directly means knowing its register map and encoding
+for that specific board, and a wrong register there puts an arbitrary voltage into the CPU with no
+read-back that would catch it first.
 
 That matters when the BIOS core voltage mode is **Override**: MSI then pins the VRM output at
 the BIOS value and the CPU's VID request is ignored, so Dragon Power still works and any
@@ -107,6 +121,52 @@ rail did not, the row is marked **board ignored it**, the apply counts as failed
 says why. It also reads the mailbox at start-up and warns in the header when the BIOS left the
 core voltage in Override mode.
 
+## Base clock and CPU VDD2
+
+Both go through one interface: an **I2C mailbox in the embedded controller**. Several things worth
+setting on these boards sit on a bus the EC owns rather than on the PCH SMBus, so no amount of work
+on the SMBus controller reaches them. The EC will run a single transaction on that bus for you and
+hand back the result, and that is the only route to those devices from software.
+
+The register layout and handshake were obtained by watching the vendor tool's kernel driver, not by
+reading its code (see the notices file). What was taken is an interface description — addresses and
+a handshake, the same class of fact as a datasheet. **Neither encoding came from that trace**; both
+were established by measuring how the board responded, and in the base clock's case reading it off
+the trace gives the wrong answer entirely.
+
+**Base clock.** The clock generator is a fractional-N PLL at I2C address `0xD2`: a fixed oscillator
+of about 10002 MHz divided by `integer + fraction/2^28`. Both fields run *backwards* against
+frequency, which is the trap — the vendor tool's recorded ramp steps its fraction down, and that
+reads like an ordinary upward frequency ramp until it is anchored against a real measurement. It is
+a divider. Measured across eleven points from 100.0 to 103.1 MHz the relation holds to a thousandth
+of a MHz, and the oscillator is re-measured on each board rather than assumed.
+
+Measuring the result matters as much as setting it, because **the obvious ways of reading base clock
+are blind to a change**. The TSC runs from a fixed crystal and keeps reporting the boot-time value
+for ever; APERF/MPERF cancels out, because MPERF scales with base clock exactly as APERF does. Only
+counting unhalted core cycles against the ACPI timer, and dividing by the live multiplier, sees it.
+`--bclk-test` prints all three side by side.
+
+**CPU VDD2** is one byte on a regulator at `0x20`, a step count worth about 12 mV, measured against
+the Super I/O's own reading of the rail. That reading lags a change by several hundred milliseconds,
+which is worth knowing: sampling too early returns the old value and the reading after that shows
+the *previous* step, which looks exactly like a step that did nothing.
+
+**What keeps this safe.** A wrong value here does not produce a wrong reading, it stops the machine
+— or, on a regulator whose byte reaches past 3 V, takes the memory controller with it. So:
+
+* Base clock is capped at **102.5 MHz** and VDD2 clamped to **1.100–1.450 V**, checked against what
+  was *measured* afterwards and not only against what was asked for.
+* Nothing computes an absolute value from an assumed zero point. The current setting is read, the
+  current result measured, and the target approached in small steps.
+* Every step is measured — base clock against the ACPI timer, which does not move with it; VDD2 at
+  the board. Anything that lands off target puts back the value found at start-up and stops.
+* VDD2 may not move more than twenty steps from where it started, whatever the arithmetic says.
+
+Both reset on reboot. Note that the value **0** restores puts back what the row held when Roch CPU
+*started*, so if you raise the base clock, close the window and reopen it, that raised value is the
+new starting point — reboot to get back to the BIOS setting.
+
 ## AMD Ryzen
 
 On an AMD CPU the window swaps the Intel rows for the ones the SMU (the System Management
@@ -124,7 +184,7 @@ care who made the board.
 | FMax | RSMU `GetBoostLimitFrequency` / `SetBoostLimitFrequencyAllCores` | the all-core boost ceiling; Zen 4 and later |
 | DDR5 VDD / VDDQ / VPP per DIMM | the PMIC on each module over the FCH SMBus | same as Intel, see below |
 | Temperature, VID, clocks, package power, SoC-side voltages, FCLK / UCLK / MCLK | SMN thermal block, SVI3 telemetry, HW P-state MSR, RAPL MSRs, SMU power table | shown by `--probe` only. The SoC rails and the memory clocks are BIOS settings the SMU has no message to change, so they are not offered as rows. The Super I/O rails shown on Intel are hidden on AMD, where the board's channel map is not known. |
-| Base clock | measured, TSC against the ACPI timer, using the P0 multiplier | read-only |
+| Base clock | measured by counting core cycles against the ACPI timer, using the P0 multiplier | read-only: the setting path is the MSI EC mailbox, which is an Intel-board feature here |
 
 The SMU is reached through the SMN index/data pair in the north bridge's PCI configuration
 space (D0F0 0x60 / 0x64) under the same `Global\Access_PCI` mutex HWiNFO, Ryzen Master and
@@ -254,9 +314,16 @@ seems to do nothing.
 measures the rail the VRM actually produces, restores the previous setting, and states plainly
 whether the board follows the CPU.
 
-`--smbus-scan`, `--sio-dump`, `--ec-dump` and `--ec-peek` are the read-only probes used to work
-the above out: devices on the PCH SMBus, the Super I/O voltage channels, the whole EC space, and
-named EC registers. Use them when porting to a board with a different sensor chip.
+`--smbus-scan`, `--sio-dump` and `--sio-ldn` are the read-only probes for porting to a board with
+a different sensor chip: devices answering on the SMBus, the Super I/O voltage channels, and the
+Super I/O's logical devices with their I/O windows. `--clkgen` and `--clkgen-dump` do the same for
+the clock generator, and `--vdd2` with no argument reports the VDD2 regulator without touching it.
+
+`--help` lists every switch.
+
+The EC dump and peek probes that used to be here are gone. They polled the EC as fast as the LPC
+path allowed and hard-reset this machine twice: that chip also runs fan control and power
+sequencing, and saturating it hangs the board.
 
 ## Using it
 
@@ -288,12 +355,18 @@ The status line under the buttons says what the last Apply did.
   writing on rails whose scale matches, and verifies each write by reading the register back
   **and** re-measuring with the ADC. A vendor-locked PMIC cannot be calibrated, so its rows
   stay read-only.
+* Base clock and CPU VDD2 are the two controls where a wrong value stops the machine rather than
+  showing a wrong number, so both are hard-capped, approached in small steps, and **measured after
+  every step**, with the start-up value put back the moment one lands off target. See
+  [Base clock and CPU VDD2](#base-clock-and-cpu-vdd2).
 * Ratios and voltages set here are not persistent: a reboot returns to BIOS values.
 
 ## Layout
 
 ```
-src/RochPower/Hardware   driver client (WinRing0), Intel MSR/CPU + OC mailbox, AMD CPU + SMU mailbox, PCH SMBus, DDR5 PMIC, SMBIOS, BCLK meter
+src/RochPower/Hardware   driver client (WinRing0), Intel MSR/CPU + OC mailbox, AMD CPU + SMU mailbox,
+                         PCH SMBus, DDR5 PMIC, SMBIOS, BCLK meter, Super I/O,
+                         EC I2C mailbox + clock generator + VDD2 regulator
 src/RochPower/Core       settings model, hardware model (picks the Intel or AMD rows)
 src/RochPower/UI         theme, main window, per-core ratio dialog (Intel), Curve Optimizer dialog (AMD), log window
 drivers/                 WinRing0x64.sys (signed, extracted from LibreHardwareMonitorLib 0.9.4); pawnio/RyzenSMU.bin (signed PawnIO module, optional)
@@ -306,9 +379,16 @@ assets/                  the Roch mark, icon
 ## Validated on
 
 MSI Z790MPOWER (BIOS P.90) with an i5-14600KF and a DDR5 kit at 1.470 / 1.410 / 1.800 V.
-Every reading was cross-checked against MSI Dragon Power on the same machine. Two things that
-came out of that: the OC mailbox's SA voltage lives in domain 4 on Raptor Lake (documentation
-usually says 3), and the VDD register scale above.
+Every reading was cross-checked against MSI Dragon Power on the same machine. Four things came out
+of that, all of them cases where the measurement disagreed with the documentation or with the
+obvious reading and the measurement won:
+
+* The OC mailbox's **SA voltage lives in domain 4** on Raptor Lake; published tables usually say 3.
+* **E-core L2 is domain 5**, not 3. The rail exists and is settable even with the E-cores switched
+  off in the BIOS, so that row is not gated on the core count.
+* The **DDR5 VDD register scale** above: 10 mV per step on overclocking kits, not the JEDEC 5 mV.
+* The **base clock is a divider**, so its register runs backwards against frequency — and both of
+  the obvious ways to measure the result are blind to a change.
 
 MSI B850MPOWER (BIOS 1.A21) with a Ryzen 7 9850X3D (Granite Ridge, SMU 0.98.83). The Curve
 Optimizer read-back matched the values ZenStates showed on the same machine, the SMU accepted

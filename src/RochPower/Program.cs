@@ -14,6 +14,9 @@ internal static class Program
         // The diagnostic switches print to the console they were launched from; a WinExe has none of its own.
         if (args.Length > 0) Native.AttachConsole(Native.ATTACH_PARENT_PROCESS);
 
+        if (args.Length > 0 && (args[0] is "--help" or "-h" or "/?"))
+            return Help();
+
         if (args.Length > 0 && args[0].Equals("--probe", StringComparison.OrdinalIgnoreCase))
             return Probe(args.Length > 1 ? args[1] : Path.Combine(AppContext.BaseDirectory, "probe.txt"));
 
@@ -44,11 +47,19 @@ internal static class Program
             return 0;
         }
 
-        // NOTE: the EC dump/peek/poke/watch modes that lived here are gone. They polled the Super I/O EC as fast as the LPC
-        // path allowed, to capture the order of Dragon Power's writes. It hard-reset this machine
-        // twice (Kernel-Power 41). The NCT6687D also runs fan control and power sequencing, and
+        // NOTE: several EC modes that lived here are gone, and should not come back in that shape.
+        //
+        // The dump/peek/poke/watch modes polled the Super I/O EC as fast as the LPC path allowed,
+        // to catch the order of the vendor tool's writes. That hard-reset this machine twice
+        // (Kernel-Power 41): the NCT6687D also runs fan control and power sequencing, and
         // saturating it - especially while another tool holds the same ISA lock - hangs the board.
         // Do not reintroduce high-rate EC polling.
+        //
+        // --ec-capture, --ec-restore and --bclk-step went with them. Those were built on a reading
+        // of the EC that turned out to be wrong: 0x463 taken for a doorbell with the parameter at
+        // 0x470. 0x463 is the command, 0x460 is the doorbell, and 0x470 is the mailbox's write-data
+        // register - which is why the vendor tool's value appeared there and why writing it alone
+        // did nothing. See EcMailbox for what it actually is.
 
         if (args.Length > 0 && args[0].Equals("--smbus-reset", StringComparison.OrdinalIgnoreCase))
         {
@@ -76,87 +87,6 @@ internal static class Program
             return 0;
         }
 
-        if (args.Length > 0 && args[0].Equals("--ec-restore", StringComparison.OrdinalIgnoreCase))
-        {
-            // Puts the vendor command block back to the idle state seen in the capture: no
-            // pending parameter, doorbell clear.
-            using var hwR = new HardwareModel();
-            hwR.Initialize();
-            if (hwR.SuperIo is not { Kind: SuperIoKind.NuvotonEc } sioR) { Console.WriteLine("no EC"); return 1; }
-            Console.WriteLine($"before: 0x463=0x{sioR.ReadRaw(0x463):X2}  0x470=0x{sioR.ReadRaw(0x470):X2}");
-            sioR.WriteRaw(0x470, 0x00);
-            sioR.WriteRaw(0x463, (byte)(sioR.ReadRaw(0x463) & 0x7F));   // clear the doorbell bit only
-            Thread.Sleep(300);
-            Console.WriteLine($"after : 0x463=0x{sioR.ReadRaw(0x463):X2}  0x470=0x{sioR.ReadRaw(0x470):X2}");
-            return 0;
-        }
-
-        if (args.Length > 0 && args[0].Equals("--bclk-step", StringComparison.OrdinalIgnoreCase))
-        {
-            // Replays the exact sequence captured from the vendor tool's BCLK ramp: stage a
-            // parameter at 0x470, ring the doorbell (bit 7 of the command byte at 0x463), wait
-            // for the EC to clear it. Measures BCLK either side so a step that does nothing - or
-            // does something unexpected - is visible immediately.
-            using var hwS = new HardwareModel();
-            hwS.Initialize();
-            if (hwS.SuperIo is not { Kind: SuperIoKind.NuvotonEc } sioS || hwS.Cpu is not { } cpuS
-                || hwS.Bclk is not { IsAvailable: true } meterS)
-            { Console.WriteLine("needs the Nuvoton EC and a working BCLK meter"); return 1; }
-            byte param = args.Length > 1 ? Convert.ToByte(args[1], 16) : (byte)0x01;
-
-            double? before = meterS.MeasureBclkFromCycles(cpuS.FirstPThread);
-            byte cmd = sioS.ReadRaw(0x463);
-            Console.WriteLine($"before: BCLK {before:0.000} MHz, 0x463=0x{cmd:X2}, 0x470=0x{sioS.ReadRaw(0x470):X2}");
-            if ((cmd & 0x80) != 0) { Console.WriteLine("EC busy (doorbell already set) - not touching it"); return 1; }
-
-            sioS.WriteRaw(0x470, param);
-            sioS.WriteRaw(0x463, (byte)(cmd | 0x80));
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            while ((sioS.ReadRaw(0x463) & 0x80) != 0 && sw.ElapsedMilliseconds < 2000) Thread.Sleep(20);
-            bool acked = (sioS.ReadRaw(0x463) & 0x80) == 0;
-            Console.WriteLine($"doorbell {(acked ? $"acknowledged in {sw.ElapsedMilliseconds} ms" : "NOT acknowledged")}; 0x470 now 0x{sioS.ReadRaw(0x470):X2}");
-
-            Thread.Sleep(400);
-            double? after = meterS.MeasureBclkFromCycles(cpuS.FirstPThread);
-            Console.WriteLine($"after : BCLK {after:0.000} MHz   delta {(after - before) * 1000:+0;-0} kHz");
-            return 0;
-        }
-
-        if (args.Length > 0 && args[0].Equals("--ec-capture", StringComparison.OrdinalIgnoreCase))
-        {
-            // Deliberately slow. An earlier version of this polled the EC as fast as the LPC path
-            // allowed (~27,000 reads/s) and hard-reset the machine twice, because that chip also
-            // runs fan control and power sequencing. This does 24 registers ten times a second -
-            // about 240 reads/s, roughly what ordinary sensor polling costs - which is ample when
-            // the thing being watched steps once per second.
-            using var hwE = new HardwareModel();
-            hwE.Initialize();
-            if (hwE.SuperIo is not { } sioE) { Console.WriteLine("no Super I/O"); return 1; }
-            if (sioE.Kind != SuperIoKind.NuvotonEc) { Console.WriteLine($"{sioE.Name} has no EC address space"); return 1; }
-            int seconds = args.Length > 1 ? int.Parse(args[1], CultureInfo.InvariantCulture) : 15;
-            const ushort first = 0x460, last = 0x477;
-            int n = last - first + 1;
-            var prev = new byte[n];
-            for (int i = 0; i < n; i++) prev[i] = sioE.ReadRaw((ushort)(first + i));
-            Console.WriteLine($"Watching EC 0x{first:X3}-0x{last:X3} at 10 Hz for {seconds}s.");
-            Console.WriteLine("baseline " + string.Join(" ", prev.Select(b => b.ToString("X2"))));
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            while (sw.Elapsed.TotalSeconds < seconds)
-            {
-                for (int i = 0; i < n; i++)
-                {
-                    byte v = sioE.ReadRaw((ushort)(first + i));
-                    if (v != prev[i])
-                    {
-                        Console.WriteLine($"{sw.Elapsed.TotalMilliseconds,9:0} ms  0x{first + i:X3}: {prev[i]:X2} -> {v:X2}");
-                        prev[i] = v;
-                    }
-                }
-                Thread.Sleep(100);
-            }
-            Console.WriteLine("done");
-            return 0;
-        }
 
         if (args.Length > 0 && args[0].Equals("--sio-ldn", StringComparison.OrdinalIgnoreCase))
         {
@@ -185,55 +115,6 @@ internal static class Program
                     Console.WriteLine($"   LDN 0x{ldn:X2}  active={active:X2}  base0=0x{b0:X4}  base1=0x{b1:X4}");
                 }
                 drvL.WriteIoPortByte(port, 0xAA);
-            }
-            return 0;
-        }
-
-        if (args.Length > 0 && args[0].Equals("--cpu-bench", StringComparison.OrdinalIgnoreCase))
-        {
-            // Work actually completed per unit time, timed by the ACPI power-management timer.
-            // That crystal is independent of BCLK, the TSC and every performance counter, so this
-            // says how fast the core is really running without trusting any of them. If a BCLK
-            // change is real, the rate here moves with it.
-            using var hwC = new HardwareModel();
-            hwC.Initialize();
-            if (hwC.Cpu is not { } cpuC || hwC.Bclk is not { IsAvailable: true } meterC)
-            { Console.WriteLine("no CPU / timer"); return 1; }
-            Console.WriteLine("Work rate against two different clocks. The ACPI timer shares the platform");
-            Console.WriteLine("reference; the RTC has its own crystal and cannot be dragged by a BCLK change.");
-            for (int round = 0; round < 3; round++)
-            {
-                double acpi = meterC.MeasureWorkRate(cpuC.FirstPThread, 300);
-                double rtc = meterC.MeasureWorkRateRtc(cpuC.FirstPThread, 4);
-                var (ratio, _) = cpuC.ReadPerfStatus(cpuC.FirstPThread);
-                Console.WriteLine($"  ACPI-timed {acpi,9:0.000}   RTC-timed {rtc,9:0.000} Miter/s   ratio x{ratio}");
-            }
-            return 0;
-        }
-
-        if (args.Length > 0 && args[0].Equals("--bclk-watch", StringComparison.OrdinalIgnoreCase))
-        {
-            // One sample a second: enough to catch a BCLK change made by hand in another tool,
-            // and far too slow to bother the hardware.
-            using var hwW = new HardwareModel();
-            hwW.Initialize();
-            if (hwW.Cpu is not { } cpuW || hwW.Bclk is not { IsAvailable: true } meterW)
-            { Console.WriteLine("no CPU / BCLK meter"); return 1; }
-            int seconds = args.Length > 1 ? int.Parse(args[1], CultureInfo.InvariantCulture) : 60;
-            Console.WriteLine($"Watching BCLK for {seconds}s. Change it in the other tool now.");
-            Console.WriteLine("  time   TSC-based   core-based   ratio   core MHz");
-            var start = DateTime.UtcNow;
-            double? first = null;
-            while ((DateTime.UtcNow - start).TotalSeconds < seconds)
-            {
-                double tscB = meterW.MeasureBclkMHz(cpuW.BaseRatio, 40);
-                double? coreB = meterW.MeasureBclkFromCore(cpuW.FirstPThread, 120);
-                var (ratio, _) = cpuW.ReadPerfStatus(cpuW.FirstPThread);
-                first ??= coreB ?? tscB;
-                double now = coreB ?? tscB;
-                string flag = Math.Abs(now - first.Value) > 0.25 ? "   <-- CHANGED" : "";
-                Console.WriteLine($"  {(DateTime.UtcNow - start).TotalSeconds,4:0}s  {tscB,8:0.000}  {coreB,10:0.000}  {ratio,6}  {(coreB ?? tscB) * ratio,9:0}{flag}");
-                Thread.Sleep(700);
             }
             return 0;
         }
@@ -743,6 +624,56 @@ internal static class Program
     /// Headless self-test: initialises the hardware layer, reads everything, performs
     /// no-op rewrites (same value) to confirm the write paths are accepted, and writes a report.
     /// </summary>
+    /// <summary>
+    /// Lists the switches. Run with no arguments the program is a window; the switches exist for
+    /// reporting a board that misbehaves and for porting to hardware this has not seen.
+    /// </summary>
+    private static int Help()
+    {
+        Console.WriteLine($"""
+            Roch CPU {MainForm.AppVersion} - CPU and memory tuning for Intel LGA1700 and AMD Ryzen.
+            Run with no arguments for the window. Everything below needs administrator rights.
+
+            Reporting
+              --probe [file]        every register the tool relies on, plus no-op write checks.
+                                    Attach this when reporting a board that misbehaves.
+              --help                this list.
+
+            Checking a control that seems to do nothing
+              --vtest [file]        nudge core voltage and ring ratio, confirm the CPU follows, restore.
+              --vcore-test [file]   raise the core voltage request, measure the rail the VRM produces,
+                                    and say plainly whether the board follows the CPU.
+              --bclk-test           the three ways of measuring base clock side by side. Only the
+                                    core-cycle one sees a change; the other two are blind by design.
+
+            Base clock (Intel, MSI EC boards)
+              --clkgen              read the clock generator's divider and the clock it produces.
+              --clkgen-dump [a] [b] its whole register map, read-only.
+              --bclk-cal            measure the oscillator, confirm the divider model, restore.
+              --bclk-probe [d...]   write a series of dividers, measure each, restore.
+              --bclk-set <MHz>      set the base clock, measuring every step.
+
+            CPU VDD2 (Intel, MSI EC boards)
+              --vdd2                report the regulator's code and the measured rail.
+              --vdd2 <volts>        set it, one code step at a time, measuring the rail after each.
+
+            Buses and sensors
+              --sio-dump            every Super I/O voltage channel.
+              --sio-ldn             the Super I/O's logical devices and their I/O windows.
+              --smbus-scan          devices answering on the SMBus.
+              --smb-regs [file]     256 registers of each known SMBus device, as binary.
+              --smbus-reset         recover an SMBus wedged by another tool (Intel PCH only).
+
+            AMD
+              --apply <row> <value> apply one row through the same path the window uses.
+              --smu <rsmu|mp1|hsmp> <0xMSG> [args]   send one raw mailbox message. Research only:
+                                    it goes straight to the firmware with no checking.
+              --pm-dump [file]      the SMU power table (needs PawnIO).
+              --smn <0xADDR> [n]    read SMN registers.
+            """);
+        return 0;
+    }
+
     private static int Probe(string reportPath)
     {
         var sb = new StringBuilder();
@@ -770,7 +701,10 @@ internal static class Program
                 var pl = cpu.ReadPackagePowerLimits();
                 W($"Power limits : PL1 {pl.pl1} W (en={pl.pl1Enabled}) PL2 {pl.pl2} W (en={pl.pl2Enabled}) locked={pl.locked}");
                 if (hw.MailboxAvailable)
-                    foreach (var (id, name) in new[] { (0, "core"), (1, "gt"), (2, "ring"), (3, "uncore/ecore-l2"), (4, "sa"), (5, "dom5") })
+                    // Domain 5 is the E-core L2 rail and domain 3 the uncore, established by
+                    // matching every domain against the vendor tool's displayed values; published
+                    // tables commonly put E-core L2 at 3, which reads a rail nobody set.
+                    foreach (var (id, name) in new[] { (0, "core"), (1, "gt"), (2, "ring"), (3, "uncore"), (4, "sa"), (5, "ecore-l2") })
                     {
                         try { W($"Mailbox dom {id} ({name}): {cpu.Mailbox.ReadDomain(id)}  IccMax={cpu.Mailbox.ReadIccMax(id)?.ToString(CultureInfo.InvariantCulture) ?? "n/a"} A"); }
                         catch (Exception ex) { W($"Mailbox dom {id} ({name}): {ex.Message}"); }

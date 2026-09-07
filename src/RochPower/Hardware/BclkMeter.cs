@@ -154,44 +154,6 @@ public sealed class BclkMeter : IDisposable
             finally { Thread.CurrentThread.Priority = old; }
         });
     }
-
-    /// <summary>
-    /// Millions of fixed loop iterations completed per second, timed by the ACPI power-management
-    /// timer. That crystal runs at 3.579545 MHz regardless of BCLK, the TSC or any performance
-    /// counter, so this measures how fast the core is genuinely executing without trusting any of
-    /// them. Compare two runs: a real clock change moves this number proportionally.
-    /// </summary>
-    public double MeasureWorkRate(int cpuIndex, int sampleMs = 300)
-    {
-        uint mask = _timer32Bit ? 0xFFFFFFFF : 0xFFFFFF;
-        uint targetTicks = (uint)(PmTimerHz * sampleMs / 1000.0);
-        return WinRing0Driver.RunOnCpu(cpuIndex, () =>
-        {
-            var old = Thread.CurrentThread.Priority;
-            Thread.CurrentThread.Priority = ThreadPriority.Highest;
-            try
-            {
-                double x = 1.0001;
-                // warm up so the core is at its turbo ratio before the timed section
-                for (int i = 0; i < 3_000_000; i++) x = x * 1.0000001 + 1e-9;
-
-                uint p0 = ReadPmTimer();
-                long iterations = 0;
-                uint p1;
-                do
-                {
-                    for (int i = 0; i < 200_000; i++) x = x * 1.0000001 + 1e-9;
-                    iterations += 200_000;
-                    p1 = ReadPmTimer();
-                } while (((p1 - p0) & mask) < targetTicks);
-                GC.KeepAlive(x);
-                double seconds = ((p1 - p0) & mask) / PmTimerHz;
-                return iterations / seconds / 1_000_000.0;
-            }
-            finally { Thread.CurrentThread.Priority = old; }
-        });
-    }
-
     private const uint IA32_FIXED_CTR1 = 0x30A, IA32_FIXED_CTR_CTRL = 0x38D, IA32_PERF_GLOBAL_CTRL = 0x38F;
 
     /// <summary>
@@ -263,48 +225,6 @@ public sealed class BclkMeter : IDisposable
         while ((ReadCmos(0x0A) & 0x80) != 0 && guard.ElapsedMilliseconds < 50) { }
         return ReadCmos(0x00);
     }
-
-    /// <summary>
-    /// Work rate timed against the real-time clock instead of the ACPI timer.
-    ///
-    /// This exists because the ACPI PM timer, the TSC and APERF/MPERF are not independent of each
-    /// other: on a board whose BCLK adjustment moves the shared platform reference, all three
-    /// scale together and a real clock change becomes invisible to every one of them. The RTC
-    /// runs from its own 32.768 kHz watch crystal on the battery circuit, so it cannot be dragged
-    /// along. If the core genuinely speeds up, the work done per RTC second rises with it.
-    /// </summary>
-    public double MeasureWorkRateRtc(int cpuIndex, int seconds = 6)
-    {
-        return WinRing0Driver.RunOnCpu(cpuIndex, () =>
-        {
-            var old = Thread.CurrentThread.Priority;
-            Thread.CurrentThread.Priority = ThreadPriority.Highest;
-            try
-            {
-                double x = 1.0001;
-                for (int i = 0; i < 3_000_000; i++) x = x * 1.0000001 + 1e-9; // reach turbo first
-
-                byte last = RtcSeconds();
-                var edge = Stopwatch.StartNew();
-                while (RtcSeconds() == last && edge.ElapsedMilliseconds < 2000) { }  // align to a tick
-                last = RtcSeconds();
-
-                long iterations = 0;
-                int ticks = 0;
-                while (ticks < seconds)
-                {
-                    for (int i = 0; i < 100_000; i++) x = x * 1.0000001 + 1e-9;
-                    iterations += 100_000;
-                    byte now = RtcSeconds();
-                    if (now != last) { last = now; ticks++; }
-                }
-                GC.KeepAlive(x);
-                return iterations / (double)ticks / 1_000_000.0;
-            }
-            finally { Thread.CurrentThread.Priority = old; }
-        });
-    }
-
     public void Dispose()
     {
         if (_code != IntPtr.Zero) Native.VirtualFree(_code, UIntPtr.Zero, Native.MEM_RELEASE);

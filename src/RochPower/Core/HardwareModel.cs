@@ -547,7 +547,9 @@ public sealed class HardwareModel : IDisposable
         }
         AddVdd2Row(sio);
         AddBoardRail("cpu_aux", "CPU AUX Voltage", Hardware.SuperIo.RailAux,
-            "CPU AUX rail, measured at the board. It is produced by the motherboard VRM and has no CPU register, so it cannot be set from here - only from the BIOS or the board vendor's own tool.");
+            "CPU AUX rail, measured at the board. It is produced by the motherboard VRM, like CPU VDD2, and most likely " +
+            "sits on the same EC I2C bus - but which device and register carry it has not been established, and this " +
+            "does not write a regulator it has not verified. Set it in the BIOS.");
     }
 
     /// <summary>

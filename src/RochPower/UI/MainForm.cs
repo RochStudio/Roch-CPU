@@ -7,7 +7,7 @@ namespace RochPower.UI;
 public sealed class MainForm : Form
 {
     public const string AppName = "Roch CPU";
-    public const string AppVersion = "1.0.0";
+    public const string AppVersion = "1.0.1";
     private const int ResizeBorder = 6;
 
     private readonly HardwareModel _hw = new();
@@ -425,77 +425,92 @@ public sealed class MainForm : Form
     }
 
     /// <summary>
-    /// Parses and confirms on the UI thread, then does the hardware writes on a worker so the
-    /// window stays live. A base-clock change measures the clock after every step and so takes a
-    /// second or two; doing that inline froze the window for the whole apply.
+    /// Runs hardware work on a worker thread so the window stays live, and puts the controls back
+    /// when it finishes. Anything that writes hardware from the buttons goes through here.
     ///
-    /// The slow refresh is stopped for the duration. It is not only that its repaint would fight
-    /// the row updates: it measures the base clock on its own worker, and two overlapping
-    /// measurements share the same fixed counters, which would make a step look like it had
-    /// missed and trigger a needless restore.
+    /// A base-clock or VDD2 change measures the result after every step, so it takes a second or
+    /// more; doing that inline froze the window for the whole operation. The slow refresh is
+    /// stopped for the duration, and not only so its repaint does not fight the row updates: it
+    /// measures the base clock on its own worker, and two overlapping measurements share the same
+    /// fixed counters, which would make a step look like it had missed and trigger a restore that
+    /// was never needed.
     /// </summary>
-    private void ApplyAll()
+    private void RunOnHardware(string busyText, Func<(string Status, bool Error)> work)
     {
         if (_applying) return;
-
-        var work = new List<(Setting Setting, TextBox Box, double Value)>();
-        int failed = 0;
-        foreach (var (s, box) in _boxes)
-        {
-            if (s.ReadOnly) continue;
-            string text = box.Text.Trim();
-            if (text.Length == 0 || text.Equals(s.CurrentText, StringComparison.OrdinalIgnoreCase)) continue;
-            if (!s.TryParse(text, out double value)) { AppendLog($"{s.Name}: '{text}' is not a number."); failed++; SetRowStatus(s, "invalid", Theme.Danger); continue; }
-            if (value != 0 && !ConfirmDangerous(s, value)) { SetRowStatus(s, "skipped", Theme.Muted); continue; }
-            work.Add((s, box, value));
-        }
-
-        if (work.Count == 0)
-        {
-            if (failed == 0) SetStatus("Nothing to apply: no field differs from the hardware.", false);
-            else SetStatus($"Applied at {DateTime.Now:HH:mm:ss}  ·  0 ok, {failed} failed", true);
-            return;
-        }
-
         _applying = true;
         _slowRefresh.Stop();
-        SetApplyEnabled(false);
-        SetStatus("Applying...", false);
+        SetControlsEnabled(false);
+        SetStatus(busyText, false);
 
-        int preFailed = failed;
         Task.Run(() =>
         {
             // A base-clock measurement started by the last refresh may still be in flight, and it
-            // owns the same fixed counters the apply is about to measure with. Let it finish.
+            // owns the same fixed counters this is about to measure with. Let it finish.
             for (int i = 0; i < 40 && _bclkBusy; i++) Thread.Sleep(25);
 
-            int applied = 0, hwFailed = preFailed;
-            foreach (var (s, box, value) in work)
-            {
-                bool ok = _hw.Apply(s, value);
-                bool ignored = ok && s.Id is "core_v" or "core_off" && _hw.CoreVoltageIgnored;
-                if (ok && !ignored) applied++; else hwFailed++;
-                BeginInvoke(() =>
-                {
-                    SetRowStatus(s, ignored ? "board ignored it" : ok ? "applied" : "failed", ok && !ignored ? Theme.Ok : Theme.Danger);
-                    box.Text = s.CurrentText;
-                });
-            }
+            (string Status, bool Error) result;
+            try { result = work(); }
+            catch (Exception ex) { result = (ex.Message, true); }
+
             BeginInvoke(() =>
             {
-                SetStatus($"Applied at {DateTime.Now:HH:mm:ss}  ·  {applied} ok, {hwFailed} failed", hwFailed > 0);
-                AppendLog($"Apply: {applied} applied, {hwFailed} failed.");
-                SetApplyEnabled(true);
+                SetStatus(result.Status, result.Error);
+                SetControlsEnabled(true);
                 _applying = false;
                 _slowRefresh.Start();
             });
         });
     }
 
-    private void SetApplyEnabled(bool on)
+    private void ApplyAll()
+    {
+        if (_applying) return;
+
+        // Parsing and the confirmation dialog stay on the UI thread, where they belong.
+        var work = new List<(Setting Setting, TextBox Box, double Value)>();
+        int rejected = 0;
+        foreach (var (s, box) in _boxes)
+        {
+            if (s.ReadOnly) continue;
+            string text = box.Text.Trim();
+            if (text.Length == 0 || text.Equals(s.CurrentText, StringComparison.OrdinalIgnoreCase)) continue;
+            if (!s.TryParse(text, out double value)) { AppendLog($"{s.Name}: '{text}' is not a number."); rejected++; SetRowStatus(s, "invalid", Theme.Danger); continue; }
+            if (value != 0 && !ConfirmDangerous(s, value)) { SetRowStatus(s, "skipped", Theme.Muted); continue; }
+            work.Add((s, box, value));
+        }
+
+        if (work.Count == 0)
+        {
+            if (rejected == 0) SetStatus("Nothing to apply: no field differs from the hardware.", false);
+            else SetStatus($"Applied at {DateTime.Now:HH:mm:ss}  ·  0 ok, {rejected} failed", true);
+            return;
+        }
+
+        int preFailed = rejected;
+        RunOnHardware("Applying...", () =>
+        {
+            int applied = 0, failed = preFailed;
+            foreach (var (s, box, value) in work)
+            {
+                bool ok = _hw.Apply(s, value);
+                bool ignored = ok && s.Id is "core_v" or "core_off" && _hw.CoreVoltageIgnored;
+                if (ok && !ignored) applied++; else failed++;
+                BeginInvoke(() =>
+                {
+                    SetRowStatus(s, ignored ? "board ignored it" : ok ? "applied" : "failed", ok && !ignored ? Theme.Ok : Theme.Danger);
+                    box.Text = s.CurrentText;
+                });
+            }
+            AppendLog($"Apply: {applied} applied, {failed} failed.");
+            return ($"Applied at {DateTime.Now:HH:mm:ss}  ·  {applied} ok, {failed} failed", failed > 0);
+        });
+    }
+
+    private void SetControlsEnabled(bool on)
     {
         _btnApply.Enabled = on; _btnRevert.Enabled = on; _btnReset.Enabled = on;
-        _btnApply.Text = on ? "Apply" : "Applying...";
+        _btnApply.Text = on ? "Apply" : "Working...";
     }
 
     private bool ConfirmDangerous(Setting s, double value)
@@ -524,9 +539,22 @@ public sealed class MainForm : Form
 
     private void RestoreDefaults()
     {
+        if (_applying) return;
         if (MessageBox.Show(this, $"Put every value back to what it was when {AppName} started?", AppName, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
-        _hw.RestoreAllDefaults();
-        RefreshRows("Reset: start-up values restored.");
+        // On a worker for the same reason as Apply: putting the base clock and VDD2 back walks
+        // them a step at a time, measuring each, which is seconds of work.
+        RunOnHardware("Restoring...", () =>
+        {
+            _hw.RestoreAllDefaults();
+            _hw.RefreshAll();
+            BeginInvoke(() =>
+            {
+                foreach (var (s, box) in _boxes) box.Text = s.CurrentText;
+                foreach (var (s, l) in _rangeLabels) { l.Text = s.ReadOnly ? "read-only" : s.RangeText; l.ForeColor = Theme.Muted; }
+            });
+            AppendLog("Reset: start-up values restored.");
+            return ("Reset: start-up values restored.", false);
+        });
     }
 
     // ------------------------------------------------------------------ per core / auto
