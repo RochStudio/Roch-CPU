@@ -50,6 +50,26 @@ internal static class Program
         // saturating it - especially while another tool holds the same ISA lock - hangs the board.
         // Do not reintroduce high-rate EC polling.
 
+        if (args.Length > 0 && args[0].Equals("--smbus-reset", StringComparison.OrdinalIgnoreCase))
+        {
+            using var hw9 = new HardwareModel();
+            hw9.Initialize();
+            var bus9 = hw9.Smbus;
+            if (bus9 == null) { Console.WriteLine("no SMBus"); return 1; }
+            Console.WriteLine("soft reset : " + bus9.Reset());
+            Console.WriteLine("host reset : " + bus9.HardReset());
+            for (int attempt = 1; attempt <= 3; attempt++)
+            {
+                var found = Ddr5Dimm.Probe(bus9);
+                Console.WriteLine($"attempt {attempt}: {found.Count} DDR5 module(s) " +
+                                  string.Join(", ", found.Select(d => $"{d.SlotName}@0x{d.SpdAddress:X2}")));
+                if (found.Count > 0) break;
+                bus9.Reset();
+                Thread.Sleep(300);
+            }
+            return 0;
+        }
+
         if (args.Length > 0 && args[0].Equals("--vcore-test", StringComparison.OrdinalIgnoreCase))
             return VcoreTest(args.Length > 1 ? args[1] : Path.Combine(AppContext.BaseDirectory, "vcore.txt"));
 

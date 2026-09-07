@@ -123,6 +123,126 @@ public sealed class SmbusI801 : ISmbus
         }
     }
 
+    private const byte PROTO_BLOCK_DATA = 5 << 2;
+    private const byte STS_BYTE_DONE = 0x80;
+    private const int BLOCK_DB = 0x07;
+
+    // NOTE: a QuickCommand() scan lived here. Driving a bare address phase across every
+    // address hung this board's SMBus - afterwards no device answered at all, including the DDR5
+    // SPD hubs, and only a power cycle brought it back. Detect devices with a byte read instead.
+
+    /// <summary>SMBus block read. Returns the payload, or null when the device does not answer.</summary>
+    public byte[]? BlockRead(byte address, byte command)
+    {
+        lock (_lock)
+        {
+            if (!Acquire()) return null;
+            try
+            {
+                byte sts = In(HST_STS);
+                if ((sts & STS_BUSY) != 0) { Out(HST_CNT, CNT_KILL); Thread.Sleep(1); Out(HST_CNT, 0); if ((In(HST_STS) & STS_BUSY) != 0) return null; }
+                if ((sts & STS_ALL_FLAGS) != 0) Out(HST_STS, (byte)(sts & STS_ALL_FLAGS));
+
+                Out(XMIT_SLVA, (byte)((address << 1) | 1));
+                Out(HST_CMD, command);
+                Out(AUX_CTL, 0);                 // byte-at-a-time, no 32-byte buffer
+                Out(HST_CNT, PROTO_BLOCK_DATA | CNT_START);
+
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                bool Wait(byte flag)
+                {
+                    while (sw.ElapsedMilliseconds < 100)
+                    {
+                        byte s = In(HST_STS);
+                        if ((s & STS_ERROR_FLAGS) != 0) return false;
+                        if ((s & flag) != 0) return true;
+                        Thread.SpinWait(50);
+                    }
+                    return false;
+                }
+
+                if (!Wait(STS_BYTE_DONE)) { Abort(); return null; }
+                int count = In(HST_D0);
+                if (count is < 1 or > 32) { Abort(); return null; }
+                var data = new byte[count];
+                for (int i = 0; i < count; i++)
+                {
+                    data[i] = In(BLOCK_DB);
+                    Out(HST_STS, STS_BYTE_DONE);  // advance to the next byte
+                    if (i < count - 1 && !Wait(STS_BYTE_DONE)) { Abort(); return null; }
+                }
+                sts = In(HST_STS);
+                Out(HST_STS, (byte)(sts & STS_ALL_FLAGS));
+                Out(HST_STS, STS_INUSE);
+                return data;
+            }
+            finally { Release(); }
+        }
+    }
+
+    /// <summary>
+    /// Bring the host controller back to idle. A transaction that was killed part way, or an
+    /// address phase a device never completed, leaves BUSY or the in-use semaphore set and every
+    /// later transfer then fails. This is the recovery path for that.
+    /// </summary>
+    public string Reset()
+    {
+        lock (_lock)
+        {
+            var before = In(HST_STS);
+            for (int i = 0; i < 3; i++)
+            {
+                Out(HST_CNT, CNT_KILL);
+                Thread.Sleep(2);
+                Out(HST_CNT, 0);
+                Thread.Sleep(2);
+                Out(HST_STS, STS_ALL_FLAGS | STS_BYTE_DONE); // clear every latched flag
+                Out(HST_STS, STS_INUSE);                     // hand the in-use semaphore back
+                Thread.Sleep(2);
+                if ((In(HST_STS) & STS_BUSY) == 0) break;
+            }
+            var after = In(HST_STS);
+            return $"HST_STS 0x{before:X2} -> 0x{after:X2}";
+        }
+    }
+
+    /// <summary>
+    /// Soft-reset the host controller through HSTCFG (PCI 0:31:4 offset 0x40, bit 3 = SSRESET).
+    /// Needed when HOST_BUSY latches high and a KILL will not clear it, which is what a killed
+    /// or never-completed address phase leaves behind.
+    /// </summary>
+    public string HardReset()
+    {
+        lock (_lock)
+        {
+            if (!_drv.ReadPciConfig(Bus, Device, Function, 0x40, out uint cfg))
+                return "could not read HSTCFG";
+            uint before = cfg;
+            _drv.WritePciConfig(Bus, Device, Function, 0x40, cfg | 0x08);   // SSRESET
+            Thread.Sleep(10);
+            _drv.WritePciConfig(Bus, Device, Function, 0x40, cfg & ~0x08u); // release, HST_EN preserved
+            Thread.Sleep(10);
+            Out(HST_STS, STS_ALL_FLAGS | STS_BYTE_DONE);
+            Out(HST_STS, STS_INUSE);
+            Thread.Sleep(10);
+            _drv.ReadPciConfig(Bus, Device, Function, 0x40, out uint after);
+            return $"HSTCFG 0x{before:X2} -> 0x{after:X2}, HST_STS now 0x{In(HST_STS):X2}";
+        }
+    }
+
+    private void Abort()
+    {
+        try
+        {
+            Out(HST_CNT, CNT_KILL);
+            Thread.Sleep(1);
+            Out(HST_CNT, 0);
+            Out(HST_STS, STS_ALL_FLAGS);
+            Out(HST_STS, STS_INUSE);
+        }
+        catch { }
+    }
+
     public bool ReadByte(byte address, byte command, out byte value)
     {
         bool ok = Transaction(address, command, PROTO_BYTE_DATA, true, 0, out ushort r);

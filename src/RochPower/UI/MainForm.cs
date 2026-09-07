@@ -283,8 +283,11 @@ public sealed class MainForm : Form
         var sm = _hw.Smbios;
         if (_hw.Cpu != null || _hw.Amd != null)
         {
+            // Vendor-neutral summary from the model (Intel and AMD both feed it). The generation
+            // string is deliberately not shown: it is still detected and still drives the
+            // platform warning, it just does not earn a line in the header.
             _lblCpu.Text = _hw.CpuName;
-            _lblCores.Text = _hw.CpuGeneration.Length > 0 ? $"{_hw.CoreSummary}  ·  {_hw.CpuGeneration}" : _hw.CoreSummary;
+            _lblCores.Text = _hw.CoreSummary;
         }
         else
         {
