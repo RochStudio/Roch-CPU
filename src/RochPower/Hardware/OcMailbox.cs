@@ -28,13 +28,18 @@ public sealed class OcMailbox
     public const byte CMD_READ_ICCMAX = 0x16;
     public const byte CMD_WRITE_ICCMAX = 0x17;
 
-    // Domain indices (Intel OC library: IA core, GT, ring, uncore, system agent).
-    // Verified on a Raptor Lake-S / Z790 system: domain 4 carries the BIOS "SA Voltage" override.
-    public const int DOMAIN_CORE = 0;   // IA cores (P-cores)
-    public const int DOMAIN_GT = 1;     // Graphics
-    public const int DOMAIN_RING = 2;   // Ring / LLC (cache)
-    public const int DOMAIN_ECORE = 3;  // Uncore / E-core L2 on hybrid parts
-    public const int DOMAIN_SA = 4;     // System agent
+    // Domain indices. Read off the hardware rather than taken from the usual documentation, by
+    // comparing every domain against the values the vendor tool displays on a Raptor Lake-S /
+    // Z790 board: domain 4 held the BIOS "SA Voltage" (1.190 V) and domain 5 the
+    // "CPU E-Core L2 Voltage" (1.050 V), both matching to the millivolt. Domain 3 is the uncore
+    // and reads zero here. Published tables commonly list E-core L2 as 3, which is wrong on
+    // this part - reading domain 3 gets a rail nobody set.
+    public const int DOMAIN_CORE = 0;    // IA cores (P-cores)
+    public const int DOMAIN_GT = 1;      // Graphics
+    public const int DOMAIN_RING = 2;    // Ring / LLC (cache)
+    public const int DOMAIN_UNCORE = 3;  // Uncore
+    public const int DOMAIN_SA = 4;      // System agent
+    public const int DOMAIN_ECORE = 5;   // E-core L2 (present even when the E-cores are disabled)
 
     private readonly IKernelDriver _drv;
     private readonly int _cpu;

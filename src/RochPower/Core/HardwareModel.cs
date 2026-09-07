@@ -291,7 +291,9 @@ public sealed class HardwareModel : IDisposable
         }
         bool DomainReadable(int d) { try { mb!.ReadDomain(d); return true; } catch { return false; } }
         AddDomain("core", "CPU Core", OcMailbox.DOMAIN_CORE, 0.600, 1.720, mbOk && DomainReadable(OcMailbox.DOMAIN_CORE));
-        AddDomain("ecore", "CPU E-Core L2", OcMailbox.DOMAIN_ECORE, 0.600, 1.520, mbOk && cpu is { ECoreCount: > 0 } && DomainReadable(OcMailbox.DOMAIN_ECORE));
+        // Not gated on the E-core count: the L2 rail for that cluster exists and is settable even
+        // when the E-cores are switched off in the BIOS, which is exactly what the vendor tool shows.
+        AddDomain("ecore", "CPU E-Core L2", OcMailbox.DOMAIN_ECORE, 0.600, 1.520, mbOk && DomainReadable(OcMailbox.DOMAIN_ECORE));
         AddDomain("ring", "Ring", OcMailbox.DOMAIN_RING, 0.600, 1.520, mbOk && DomainReadable(OcMailbox.DOMAIN_RING));
         AddDomain("sa", "SA", OcMailbox.DOMAIN_SA, 0.600, 1.520, mbOk && DomainReadable(OcMailbox.DOMAIN_SA));
         AddDomain("gt", "GT (iGPU)", OcMailbox.DOMAIN_GT, 0.600, 1.520, mbOk && DomainReadable(OcMailbox.DOMAIN_GT));
@@ -326,7 +328,10 @@ public sealed class HardwareModel : IDisposable
             Id = "bclk", Name = "Base Clock", Group = SettingGroup.Clocks, Min = 10, Max = 655.25, Decimals = 2,
             Read = () => LastBclk,
             Write = null,
-            Note = "Measured from TSC vs ACPI timer. Read-only: BCLK programming needs the board's clock generator, which is board firmware specific.",
+            Note = "Measured against the ACPI timer, so this is the real frequency rather than the programmed one. " +
+                   "Read-only: setting BCLK at runtime needs either an external clock generator on the SMBus or the Intel ICC over HECI, " +
+                   "and on a board with neither there is nothing to write. MSI's own tool shows an editable field here that does not " +
+                   "work either - measured on a Z790MPOWER, it accepted 101.00 while the rail stayed at 99.84 MHz.",
             Available = Bclk?.IsAvailable == true && BaseRatio > 0
         });
     }
@@ -499,10 +504,8 @@ public sealed class HardwareModel : IDisposable
                 Read = () => sio.ReadVoltage(rail), Write = null, Note = note, Available = true
             });
         }
-        AddBoardRail("cpu_vdd2", IsAmd ? "SoC / VDD2 Rail" : "CPU VDD2 Voltage", Hardware.SuperIo.RailVdd2,
-            "Measured at the board. It is produced by the motherboard VRM and has no CPU register, so it cannot be set from here - only from the BIOS or the board vendor's own tool.");
         AddBoardRail("cpu_aux", "CPU AUX Voltage", Hardware.SuperIo.RailAux,
-            "CPU AUX rail, measured at the board. Board VRM only, same as VDD2: no CPU-side path to set it.");
+            "CPU AUX rail, measured at the board. It is produced by the motherboard VRM and has no CPU register, so it cannot be set from here - only from the BIOS or the board vendor's own tool.");
     }
 
     private void BuildDimms()

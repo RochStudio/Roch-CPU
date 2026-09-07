@@ -8,28 +8,37 @@ namespace RochPower.UI;
 /// </summary>
 public static class Theme
 {
-    public static readonly Color Bg = ColorTranslator.FromHtml("#0C0C0E");
-    public static readonly Color Panel = ColorTranslator.FromHtml("#151517");
-    public static readonly Color PanelAlt = ColorTranslator.FromHtml("#1D1D21");
-    public static readonly Color Border = ColorTranslator.FromHtml("#2C2C32");
-    public static readonly Color Text = ColorTranslator.FromHtml("#F3F3F5");
-    public static readonly Color Muted = ColorTranslator.FromHtml("#8B8B94");
-    public static readonly Color Accent = ColorTranslator.FromHtml("#D32F2F");
-    public static readonly Color AccentDim = ColorTranslator.FromHtml("#6E1717");
-    public static readonly Color Warn = ColorTranslator.FromHtml("#FF7A7A");
-    public static readonly Color Danger = ColorTranslator.FromHtml("#E53935");
-    public static readonly Color Ok = ColorTranslator.FromHtml("#9A9AA4");
+    // Palette shared with Roch Viewer's dark theme, taken from its own constants so the two
+    // tools read as one family rather than merely similar.
+    public static readonly Color Bg = ColorTranslator.FromHtml("#101010");        // BG_COLOR
+    public static readonly Color Panel = ColorTranslator.FromHtml("#161616");     // BG_COLOR2 / SECTION_COLOR
+    public static readonly Color PanelAlt = ColorTranslator.FromHtml("#1A1A1A");  // ROW_COLOR
+    public static readonly Color Header = ColorTranslator.FromHtml("#1C1C1C");    // HEADER_COLOR
+    public static readonly Color Highlight = ColorTranslator.FromHtml("#171717"); // HIGHLIGHT_COLOR
+    public static readonly Color Border = ColorTranslator.FromHtml("#2A2A2A");
+    public static readonly Color Text = ColorTranslator.FromHtml("#FFFFFF");      // TEXT_COLOR
+    public static readonly Color Muted = ColorTranslator.FromHtml("#B0B0B0");     // SUBTITLE_COLOR
+    public static readonly Color Accent = ColorTranslator.FromHtml("#FF4D4D");    // BRAND_COLOR / VALUE_COLOR
+    public static readonly Color AccentDim = ColorTranslator.FromHtml("#5D1A1A");
+    public static readonly Color Hairline = ColorTranslator.FromHtml("#C53F3F");  // HAIRLINE_COLOR
+    public static readonly Color Warn = ColorTranslator.FromHtml("#FF8080");      // BRAND_HOVER_COLOR
+    public static readonly Color Danger = ColorTranslator.FromHtml("#FF4D4D");
+    public static readonly Color Ok = ColorTranslator.FromHtml("#B0B0B0");
 
-    public static readonly Font Base = new("Segoe UI", 9.75f);
-    public static readonly Font Bold = new("Segoe UI", 9.75f, FontStyle.Bold);
-    public static readonly Font Small = new("Segoe UI", 8.5f);
-    public static readonly Font SmallBold = new("Segoe UI", 8.25f, FontStyle.Bold);
-    public static readonly Font Row = new("Segoe UI Semibold", 9.5f);
-    public static readonly Font Value = new("Segoe UI Semibold", 9.5f);
-    public static readonly Font Big = new("Segoe UI Semibold", 11.5f);
-    public static readonly Font Brand = new("Segoe UI", 9.75f, FontStyle.Bold);
+    // Roch Viewer is monospace throughout (Consolas). It uses size 12 for body text; 10 here
+    // keeps the same character while letting every row stay on screen without scrolling.
+    private const string Family = "Consolas";
+    private const float Size = 10f;
+    public static readonly Font Base = new(Family, Size);
+    public static readonly Font Bold = new(Family, Size, FontStyle.Bold);
+    public static readonly Font Small = new(Family, Size - 1f);
+    public static readonly Font SmallBold = new(Family, Size - 1f, FontStyle.Bold);
+    public static readonly Font Row = new(Family, Size);
+    public static readonly Font Value = new(Family, Size, FontStyle.Bold);
+    public static readonly Font Big = new(Family, Size + 2f, FontStyle.Bold);
+    public static readonly Font Brand = new(Family, Size + 1f, FontStyle.Bold);
     public static readonly Font Glyph = new("Segoe MDL2 Assets", 8f);
-    public static readonly Font Mono = new("Consolas", 8.75f);
+    public static readonly Font Mono = new(Family, Size - 1f);
 
     public const string Author = "@MateoPCTech";
     public const string AuthorUrl = "https://x.com/MateoPCTech";

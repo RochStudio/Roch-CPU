@@ -40,6 +40,7 @@ public sealed class MainForm : Form
     private readonly System.Windows.Forms.Timer _autoTimer = new();
     private readonly System.Windows.Forms.Timer _slowRefresh = new() { Interval = 3000 };
     private bool _bclkBusy;
+    private int _rowIndex;
 
     public MainForm()
     {
@@ -50,8 +51,8 @@ public sealed class MainForm : Form
         ForeColor = Theme.Text;
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.CenterScreen;
-        MinimumSize = new Size(520, 420);
-        Size = new Size(560, 760);
+        MinimumSize = new Size(600, 420);
+        Size = new Size(620, 760);
         KeyPreview = true;
         DoubleBuffered = true;
 
@@ -171,8 +172,18 @@ public sealed class MainForm : Form
         status.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         _lblStatus.AutoSize = true;
         status.Controls.Add(_lblStatus, 0, 0);
-        var author = new LinkLabel { Text = Theme.Author, LinkColor = Theme.Accent, ActiveLinkColor = Theme.Warn, VisitedLinkColor = Theme.Accent, LinkBehavior = LinkBehavior.NeverUnderline, Font = Theme.SmallBold, AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(6, 0, 0, 0) };
+        // Roch Viewer's footer handle: brand red, bold, no underline, and colour is the whole
+        // affordance - there is no button edge, so it lifts a shade under the pointer.
+        var author = new LinkLabel
+        {
+            Text = Theme.Author, LinkColor = Theme.Accent, ActiveLinkColor = Theme.Warn, VisitedLinkColor = Theme.Accent,
+            LinkBehavior = LinkBehavior.NeverUnderline, Font = Theme.Bold, AutoSize = true,
+            BackColor = Color.Transparent, Cursor = Cursors.Hand, Margin = new Padding(6, 0, 0, 0)
+        };
         author.LinkClicked += (_, _) => { try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(Theme.AuthorUrl) { UseShellExecute = true }); } catch { } };
+        author.MouseEnter += (_, _) => author.LinkColor = Theme.Warn;
+        author.MouseLeave += (_, _) => author.LinkColor = Theme.Accent;
+        new ToolTip().SetToolTip(author, Theme.AuthorUrl);
         status.Controls.Add(author, 1, 0);
         _body.Controls.Add(status, 0, 4);
 
@@ -191,6 +202,7 @@ public sealed class MainForm : Form
         _rows.Controls.Clear();
         _rows.RowStyles.Clear();
         _boxes.Clear(); _statusLabels.Clear(); _rangeLabels.Clear();
+        _rowIndex = 0;
         SettingGroup? last = null;
         foreach (var s in _hw.Settings)
         {
@@ -211,14 +223,16 @@ public sealed class MainForm : Form
                 }));
             }
 
-            var row = new TableLayoutPanel { AutoSize = true, ColumnCount = 4, Dock = DockStyle.Top, BackColor = Theme.Bg, Margin = new Padding(0, 0, 0, 2) };
+            // Alternating row shading, the way Roch Viewer's tables read.
+            var rowBack = (_rowIndex++ % 2 == 0) ? Theme.Bg : Theme.PanelAlt;
+            var row = new TableLayoutPanel { AutoSize = true, ColumnCount = 4, Dock = DockStyle.Top, BackColor = rowBack, Margin = new Padding(0) };
             row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
             var name = Theme.Label(s.Name, Theme.Row, Theme.Text);
-            name.Margin = new Padding(0, 5, 0, 0);
+            name.Margin = new Padding(6, 5, 0, 5);
             var range = Theme.Muted_(s.ReadOnly ? "read-only" : s.RangeText);
             range.Margin = new Padding(8, 6, 8, 0);
             range.TextAlign = ContentAlignment.MiddleRight;
@@ -244,7 +258,7 @@ public sealed class MainForm : Form
     private void FitToContent()
     {
         _body.PerformLayout();
-        int needed = _body.PreferredSize.Height + 30 /* title bar */ + 4;
+        int needed = _body.PreferredSize.Height + 30 /* title bar */ + 12;
         var work = Screen.FromControl(this).WorkingArea;
         int height = Math.Min(needed, work.Height - 40);
         Height = Math.Max(MinimumSize.Height, height);
