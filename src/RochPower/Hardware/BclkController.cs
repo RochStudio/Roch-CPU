@@ -10,24 +10,38 @@ namespace RochPower.Hardware;
 /// assumed, and every step is then checked against a real measurement anyway.</para>
 ///
 /// <para><b>Why the guards are here.</b> Writing a clock generator is the one adjustment in this
-/// program where a wrong value does not produce a wrong reading, it stops the machine. So: a hard
-/// ceiling, checked against what was measured rather than only against what was asked for; steps
-/// of at most <see cref="MaxStepMHz"/>; a measurement against the ACPI timer, which does not move
-/// with the base clock, after every single step; a write order chosen so that the few milliseconds
-/// where the divider is half-updated always land on the slow side; and a restore of the block
-/// found at start-up the moment anything lands somewhere it was not aimed.</para>
+/// program where a wrong value does not produce a wrong reading, it stops the machine. There is no
+/// ceiling on what may be asked for - where a given board gives up is not something this can know -
+/// but a change is never applied blind: steps of at most <see cref="MaxStepMHz"/>; a measurement
+/// against the ACPI timer, which does not move with the base clock, after every single step; and a
+/// restore of the block found at start-up the moment one lands somewhere it was not aimed. A
+/// request the meter cannot confirm is refused rather than believed.</para>
 /// </summary>
 public sealed class BclkController
 {
     /// <summary>
-    /// Ceiling, in MHz. This is a fixed limit, applied on every path in and re-checked against the
-    /// measurement afterwards. Above roughly here the board stops being reliable: a run that
-    /// reached 103.1 MHz and kept climbing ended in an unexpected shutdown.
+    /// The widest base clock this can express and still check, in MHz. <b>This is not a safety
+    /// ceiling.</b> There is no view here about what your board tolerates: where that limit falls
+    /// depends on the board, the memory, the cache ratio and how far the CPU is already pushed,
+    /// and only the person at the machine knows it. Every board tested so far gave up well below
+    /// the top of this range.
+    ///
+    /// What the bounds are is the range in which a result can still be believed: the meter treats
+    /// anything outside it as a failed reading rather than a real clock, so a step landing there
+    /// is treated as a fault and rolled back. Widening them past what the meter can validate would
+    /// not remove a restriction, it would remove the check.
+    ///
+    /// The protection that remains is the same as it was: small steps, each one measured, and the
+    /// start-up value put back the moment one lands somewhere it was not aimed.
     /// </summary>
-    public const double MaxBclkMHz = 102.5;
+    public const double MaxBclkMHz = 200.0;
+    public const double MinBclkMHz = 50.0;
 
-    /// <summary>Floor. Below this the machine is uselessly slow and the meter gets noisy.</summary>
-    public const double MinBclkMHz = 97.0;
+    /// <summary>
+    /// Above this, applying from the window asks for confirmation first - the same treatment a
+    /// voltage outside its usual daily-use range gets. It stops a typo, not a decision.
+    /// </summary>
+    public const double ConfirmAboveMHz = 105.0;
 
     /// <summary>
     /// Largest single change, in MHz. The divider latches all at once, so this is not about
@@ -97,7 +111,7 @@ public sealed class BclkController
     {
         var vals = new List<double>();
         for (int i = 0; i < samples; i++)
-            if (_measure() is double v && v > 50 && v < 200) vals.Add(v);
+            if (_measure() is double v && v >= MinBclkMHz && v <= MaxBclkMHz) vals.Add(v);
         if (vals.Count == 0) return null;
         vals.Sort();
         return vals[vals.Count / 2];
@@ -193,7 +207,7 @@ public sealed class BclkController
             log?.Invoke($"  measured {probed:0.000} MHz");
 
             if (probed > MaxBclkMHz || probed < MinBclkMHz)
-            { Status = $"the probe reached {probed:0.000} MHz, outside the safe window - refusing to tune"; return false; }
+            { Status = $"the probe measured {probed:0.000} MHz, which the meter cannot confirm - refusing to tune"; return false; }
             if (Math.Abs(probed - (startMhz - 0.25)) > ToleranceMHz)
             { Status = $"a step aimed at {startMhz - 0.25:0.000} MHz landed at {probed:0.000} - the divider model does not hold here"; return false; }
 
@@ -215,7 +229,7 @@ public sealed class BclkController
     /// <summary>
     /// Writes a series of dividers and measures each, restoring the baseline afterwards whatever
     /// happens. For characterising a board this has not been measured on. Aborts the run if any
-    /// measurement lands outside the safe window.
+    /// measurement lands outside what the meter can confirm.
     /// </summary>
     public bool ProbeDividers(IEnumerable<double> dividers, Action<string>? log = null)
     {
@@ -232,7 +246,7 @@ public sealed class BclkController
                 double? got = Measure(4);
                 log?.Invoke($"  divider {DividerOf(attempt),11:0.000000}  predicted {MhzFor(DividerOf(attempt)),8:0.000}  measured {got:0.000} MHz");
                 if (got is double m && (m > MaxBclkMHz || m < MinBclkMHz))
-                { Status = $"probe reached {m:0.000} MHz, outside the safe window - stopping"; return false; }
+                { Status = $"probe measured {m:0.000} MHz, which the meter cannot confirm - stopping"; return false; }
             }
             Status = "probe complete";
             return true;
@@ -256,7 +270,7 @@ public sealed class BclkController
     {
         double clamped = Clamp(targetMhz);
         if (Math.Abs(clamped - targetMhz) > 0.0005)
-            log?.Invoke($"  {targetMhz:0.000} MHz is outside {MinBclkMHz:0.0}-{MaxBclkMHz:0.0}; using {clamped:0.000}");
+            log?.Invoke($"  {targetMhz:0.000} MHz is outside what can be measured ({MinBclkMHz:0.0}-{MaxBclkMHz:0.0}); using {clamped:0.000}");
 
         // One read and one measurement serve both as the starting point and, the first time, as
         // the whole of the calibration.
@@ -265,8 +279,11 @@ public sealed class BclkController
         double mhz = cur.Mhz;
         if (!Calibrated && !EstablishScale(block, mhz, log)) return false;
 
-        int guard = 0;
-        while (Math.Abs(clamped - mhz) > ToleranceMHz / 2 && guard++ < 40)
+        // Enough iterations to cover the distance asked for, with slack, rather than a fixed
+        // count: without a ceiling the walk can be long, and a loop that ran out partway would
+        // stop somewhere in the middle and report success.
+        int guard = 0, maxSteps = (int)(Math.Abs(clamped - mhz) / MaxStepMHz) + 8;
+        while (Math.Abs(clamped - mhz) > ToleranceMHz / 2 && guard++ < maxSteps)
         {
             double next = mhz + Math.Clamp(clamped - mhz, -MaxStepMHz, MaxStepMHz);
             var attempt = BlockFor(block, DividerForMhz(next));
@@ -281,11 +298,12 @@ public sealed class BclkController
             { Status = "could not measure after the write"; Restore(); return false; }
             log?.Invoke($"  aimed {next:0.000} -> measured {got:0.000} MHz");
 
-            // Checked against the measurement, not only the request, so a slip in the encoding
-            // cannot walk past the ceiling unnoticed.
+            // Against the measurement, not the request: a reading outside the range the meter can
+            // validate is a failed reading, not a clock, so treat it as a fault rather than
+            // believing it.
             if (got > MaxBclkMHz + ToleranceMHz || got < MinBclkMHz - ToleranceMHz)
             {
-                Status = $"a step landed at {got:0.000} MHz, outside the safe window; restored";
+                Status = $"a step measured {got:0.000} MHz, which is outside what the meter can confirm; restored";
                 Restore(); return false;
             }
             if (Math.Abs(got - next) > ToleranceMHz)
@@ -296,6 +314,11 @@ public sealed class BclkController
             block = attempt; mhz = got;
         }
 
+        if (Math.Abs(clamped - mhz) > ToleranceMHz)
+        {
+            Status = $"stopped at {mhz:0.000} MHz, short of {clamped:0.000}";
+            return false;
+        }
         Status = $"base clock {mhz:0.000} MHz";
         return true;
     }

@@ -27,7 +27,7 @@ voltages and board rails on one, the SMU's limits and Curve Optimizer on the oth
 ## What's new in 1.0.1
 
 * **Base clock and CPU VDD2 are settable** on MSI 600/700-series boards, through the clock
-  generator and regulator on the EC's I²C bus — capped, and measured after every step.
+  generator and regulator on the EC's I²C bus, measured after every step.
 * Apply and Reset run off the UI thread, so the window stays live while a change is measured.
 * Voltage rows re-read as the window refreshes; a bad read at launch no longer sticks.
 * The title bar's close and minimise buttons are visible again, on a grey bar.
@@ -44,7 +44,7 @@ voltages and board rails on one, the SMU's limits and Curve Optimizer on the oth
 | Ring ratio | OC mailbox + MSR 0x620 (the MSR alone is ignored on Alder/Raptor Lake) | same |
 | Core / E-core L2 / Ring / SA / GT voltage, offset or override | Intel OC mailbox (MSR 0x150) over the CPU's SVID path | every board, **if the VRM follows SVID** — see below. On Raptor Lake SA is domain 4 and E-core L2 domain 5, both measured; published tables often say 3 |
 | PL1 / PL2 power limits | MSR 0x610 | every board unless locked in BIOS |
-| Base clock | the board's clock generator, over the EC's I²C mailbox | MSI 600/700-series with a Nuvoton EC; capped at 102.5 MHz. Read-only elsewhere |
+| Base clock | the board's clock generator, over the EC's I²C mailbox | MSI 600/700-series with a Nuvoton EC. Read-only elsewhere |
 | CPU VDD2 | the board's regulator, over the same mailbox | same boards; clamped to 1.100–1.450 V |
 | DDR5 VDD / VDDQ / VPP per DIMM | the PMIC on each module over the PCH SMBus | any board leaving the SMBus visible. Vendor-locked (*secure mode*) PMICs read but refuse writes |
 | Measured Vcore, VDD2 and AUX | Super I/O over LPC (Nuvoton NCT6683/6686/6687, NCT679x, ITE IT86xx/87xx) | boards with one of those chips; elsewhere the rail check is skipped and the tool still runs |
@@ -111,12 +111,19 @@ and reading the base clock's off the trace gives the wrong answer entirely. See
 `Hardware/EcMailbox.cs`, `EcClockGen.cs`, `BclkController.cs` and `Vdd2Rail.cs`, which carry the
 detail, and [the notices](THIRD-PARTY-NOTICES.md).
 
-A wrong value here does not produce a wrong reading, it stops the machine. So base clock is capped
-at **102.5 MHz** and VDD2 clamped to **1.100–1.450 V**, checked against what was *measured*
-afterwards rather than only what was asked for; nothing is computed from an assumed zero point; the
-target is approached in small steps; and **every step is measured** — base clock against the ACPI
-timer, which does not move with it, VDD2 at the board. Anything that lands off target puts back the
-value found at start-up and stops.
+A wrong value here does not produce a wrong reading, it stops the machine. So nothing is computed
+from an assumed zero point, the target is approached in small steps, and **every step is measured**
+— base clock against the ACPI timer, which does not move with it, VDD2 at the board. Anything that
+lands off target puts back the value found at start-up and stops.
+
+**There is no ceiling on base clock.** Where a board gives up depends on the memory, the cache
+ratio and how far the CPU is already pushed, and only the person at the machine knows it — so this
+does not pretend to. Base clock scales the memory controller, the ring and the PCIe/DMI reference
+together, so a little goes a long way and past a point the machine simply stops; above 105 MHz the
+window asks for confirmation, which stops a typo rather than a decision. The one real limit is that
+a reading the meter cannot confirm is treated as a fault and rolled back, because past that point
+there is no way to know a write landed. VDD2 is clamped to **1.100–1.450 V**, where the raw byte
+reaches past 3 V and would take the memory controller with it.
 
 Measuring matters as much as setting: the TSC keeps reporting the boot-time base clock for ever,
 and APERF/MPERF cancels out. Only counting unhalted core cycles against the ACPI timer sees a
@@ -167,7 +174,8 @@ Or `dotnet publish src/RochPower -c Release -o dist`.
   says 5 mV, which would double a voltage written with the wrong scale. Roch CPU calibrates every
   rail against the PMIC's own ADC at start-up, enables writing only where the scale matches, and
   verifies each write by reading back **and** re-measuring. A vendor-locked PMIC stays read-only.
-* Base clock and VDD2 are capped and measured after every step — see above.
+* Base clock has no ceiling and VDD2 is clamped; both are approached in steps and measured after
+  every one, with the start-up value put back if a step lands off target — see above.
 * Nothing set here persists: a reboot returns to BIOS values.
 
 ## Diagnostics

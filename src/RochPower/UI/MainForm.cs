@@ -525,6 +525,9 @@ public sealed class MainForm : Form
             "ppt" => value > 500,
             "tdc" or "edc" => value > 800,
             "co_all" => value > 15,
+            // No ceiling on base clock, but it takes the memory controller and the ring with it,
+            // so a figure this far out is worth a second look before it is walked to.
+            "bclk" => value > BclkController.ConfirmAboveMHz,
             _ => false
         };
         if (!risky) return true;

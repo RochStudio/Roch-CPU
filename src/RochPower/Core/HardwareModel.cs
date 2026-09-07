@@ -370,9 +370,10 @@ public sealed class HardwareModel : IDisposable
                   "the board's own clock generator, which is only reachable where the board's EC exposes it."
                 : "Set through the board's clock generator, over the EC's own I2C bus. Every step is measured against the " +
                   "ACPI timer, which does not move with the base clock, and anything that lands off target puts back the " +
-                  "value found at start-up. The range is about a MHz wide - the generator's fine trim - and is measured on " +
-                  $"first use; {BclkController.MaxBclkMHz:0.0} MHz is a hard ceiling. Base clock scales memory and the ring " +
-                  "with it, so small changes go a long way. Enter 0 to put back the start-up value.",
+                  "value found at start-up. There is no ceiling on what you can ask for - where a board gives up is not " +
+                  "something this can know - but base clock scales the memory controller, the ring and the PCIe/DMI " +
+                  "reference with it, so a little goes a long way and past a point the machine simply stops. " +
+                  "Enter 0 to put back the start-up value.",
             Available = Bclk?.IsAvailable == true && BaseRatio > 0
         });
     }
