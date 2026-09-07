@@ -263,7 +263,7 @@ internal static class Program
             hwC.Initialize();
             Console.WriteLine(hwC.SuperIoStatus);
             if (!EcClockGen.IsSupported(hwC.SuperIo)) { Console.WriteLine("no EC mailbox on this Super I/O"); return 1; }
-            var gen = new EcClockGen(hwC.SuperIo!);
+            var gen = new EcClockGen(new EcMailbox(hwC.SuperIo!));
             for (int i = 0; i < 3; i++)
             {
                 var blk = gen.ReadBlock();
@@ -287,7 +287,7 @@ internal static class Program
             if (hwK.Cpu is not { } cpuK || hwK.Bclk is not { IsAvailable: true } meterK)
             { Console.WriteLine("no BCLK meter"); return 1; }
 
-            var ctl = new BclkController(new EcClockGen(hwK.SuperIo!), () => meterK.MeasureBclkFromCycles(cpuK.FirstPThread));
+            var ctl = new BclkController(new EcClockGen(new EcMailbox(hwK.SuperIo!)), () => meterK.MeasureBclkFromCycles(cpuK.FirstPThread));
             if (!ctl.CaptureBaseline()) { Console.WriteLine(ctl.Status); return 1; }
             Console.WriteLine(ctl.Status);
 
@@ -295,7 +295,7 @@ internal static class Program
             {
                 // Read-only sweep of the clock generator, to find what else on it moves with the
                 // base clock. Word reads overlap by a byte, so the low byte of each is the map.
-                var genD = new EcClockGen(hwK.SuperIo!);
+                var genD = new EcMailbox(hwK.SuperIo!);
                 int fromD = args.Length > 1 ? Convert.ToInt32(args[1], 16) : 0x00;
                 int toD = args.Length > 2 ? Convert.ToInt32(args[2], 16) : 0xFF;
                 Console.WriteLine($"clock generator 0x{EcClockGen.ClockGenAddress:X2}, registers 0x{fromD:X2}-0x{toD:X2}");
@@ -339,6 +339,20 @@ internal static class Program
             bool set = ctl.SetBclk(want, Console.WriteLine);
             Console.WriteLine((set ? "ok: " : "FAILED: ") + ctl.Status);
             return set ? 0 : 1;
+        }
+
+        if (args.Length > 0 && args[0].Equals("--vdd2", StringComparison.OrdinalIgnoreCase))
+        {
+            using var hwV = new HardwareModel();
+            hwV.Log += m => Console.Error.WriteLine(m);
+            hwV.Initialize();
+            if (hwV.Vdd2 is not { } rail) { Console.WriteLine("CPU VDD2 is not settable on this board"); return 1; }
+            Console.WriteLine("baseline: " + rail.Status);
+            if (args.Length < 2) { Console.WriteLine("usage: --vdd2 <volts>   (omit to just report)"); return 0; }
+            double target = double.Parse(args[1], CultureInfo.InvariantCulture);
+            bool okV = rail.SetVolts(target, Console.WriteLine);
+            Console.WriteLine((okV ? "ok: " : "FAILED: ") + rail.Status);
+            return okV ? 0 : 1;
         }
 
         if (args.Length > 0 && args[0].Equals("--vcore-test", StringComparison.OrdinalIgnoreCase))

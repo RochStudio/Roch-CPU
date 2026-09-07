@@ -14,6 +14,8 @@ public static class Theme
     public static readonly Color Panel = ColorTranslator.FromHtml("#161616");     // BG_COLOR2 / SECTION_COLOR
     public static readonly Color PanelAlt = ColorTranslator.FromHtml("#1A1A1A");  // ROW_COLOR
     public static readonly Color Header = ColorTranslator.FromHtml("#1C1C1C");    // HEADER_COLOR
+    /// <summary>Title bar: a grey strip above the black body, as in Roch Viewer.</summary>
+    public static readonly Color TitleBar = ColorTranslator.FromHtml("#1C1C1C");
     public static readonly Color Highlight = ColorTranslator.FromHtml("#171717"); // HIGHLIGHT_COLOR
     public static readonly Color Border = ColorTranslator.FromHtml("#2A2A2A");
     public static readonly Color Text = ColorTranslator.FromHtml("#FFFFFF");      // TEXT_COLOR
@@ -82,16 +84,24 @@ public static class Theme
         return b;
     }
 
-    /// <summary>Title-bar glyph button (minimise / close): transparent until hovered.</summary>
+    // Segoe MDL2 Assets code points. Windows has shipped this font since 8.1, and it is what the
+    // system's own title bars draw, so the buttons match every other window on the desktop.
+    public const string GlyphMinimise = "";
+    public const string GlyphClose = "";
+
+    /// <summary>
+    /// Title-bar glyph button (minimise / close): sits flat on the title bar until hovered, then
+    /// lifts to grey, or to red for close, the way Windows does it.
+    /// </summary>
     public static Button TitleButton(string glyph, bool close = false)
     {
         var b = new Button
         {
             Text = glyph, Font = Glyph, FlatStyle = FlatStyle.Flat, Width = 44, Height = 30, Margin = new Padding(0),
-            BackColor = Bg, ForeColor = Muted, TabStop = false, Cursor = Cursors.Default, UseVisualStyleBackColor = false
+            BackColor = TitleBar, ForeColor = Muted, TabStop = false, Cursor = Cursors.Default, UseVisualStyleBackColor = false
         };
         b.FlatAppearance.BorderSize = 0;
-        b.FlatAppearance.MouseOverBackColor = close ? Danger : PanelAlt;
+        b.FlatAppearance.MouseOverBackColor = close ? Danger : Border;
         b.FlatAppearance.MouseDownBackColor = close ? AccentDim : Panel;
         b.MouseEnter += (_, _) => b.ForeColor = close ? Color.White : Text;
         b.MouseLeave += (_, _) => b.ForeColor = Muted;

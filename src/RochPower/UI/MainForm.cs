@@ -77,7 +77,7 @@ public sealed class MainForm : Form
         Controls.Add(outer);
 
         // ---- title bar ----
-        var title = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Bg, Margin = new Padding(0) };
+        var title = new Panel { Dock = DockStyle.Fill, BackColor = Theme.TitleBar, Margin = new Padding(0) };
         var brand = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, Location = new Point(8, 0), Height = 30, BackColor = Color.Transparent };
         var mark = Theme.LoadMark(20);
         if (mark != null) brand.Controls.Add(new PictureBox { Image = mark, Size = new Size(20, 20), Margin = new Padding(0, 5, 6, 0), BackColor = Color.Transparent });
@@ -85,8 +85,8 @@ public sealed class MainForm : Form
         var cpu = Theme.Label($"CPU {AppVersion}", Theme.Brand, Theme.Text); cpu.Margin = new Padding(4, 6, 0, 0);
         brand.Controls.Add(roch); brand.Controls.Add(cpu);
         title.Controls.Add(brand);
-        var btnClose = Theme.TitleButton("", close: true);
-        var btnMin = Theme.TitleButton("");
+        var btnClose = Theme.TitleButton(Theme.GlyphClose, close: true);
+        var btnMin = Theme.TitleButton(Theme.GlyphMinimise);
         btnClose.Click += (_, _) => Close();
         btnMin.Click += (_, _) => WindowState = FormWindowState.Minimized;
         var tb = new FlowLayoutPanel { FlowDirection = FlowDirection.RightToLeft, Dock = DockStyle.Right, Width = 88, BackColor = Color.Transparent, Margin = new Padding(0) };
@@ -221,7 +221,7 @@ public sealed class MainForm : Form
                     SettingGroup.Power => _hw.IsAmd ? "Power and current limits (SMU)" : "Power limits",
                     SettingGroup.Pbo => "Precision Boost Overdrive (SMU)",
                     SettingGroup.Memory => "DDR5 memory (PMIC)",
-                    SettingGroup.Board => "Board VRM rails (measured, read-only)", _ => ""
+                    SettingGroup.Board => "Board VRM rails (measured)", _ => ""
                 }));
             }
 
@@ -399,6 +399,20 @@ public sealed class MainForm : Form
         // Board rails move on their own; keep the read-only rows current.
         foreach (var s in _hw.Settings.Where(s => s.Group == SettingGroup.Board && s.Available))
             if (_boxes.TryGetValue(s, out var box)) { _hw.Refresh(s); box.Text = s.CurrentText; }
+
+        // The mailbox voltage rows were read once at start-up and then never again, so a single
+        // read that came back wrong - one was seen reporting a domain as Auto that was in fact
+        // holding an override - stayed on screen for the life of the process. Re-read them, but
+        // only where the box still shows what was last read: anything the user has typed is
+        // theirs until they apply or revert it.
+        foreach (var s in _hw.Settings.Where(s => s.Group == SettingGroup.Voltages && s.Available))
+        {
+            if (!_boxes.TryGetValue(s, out var box) || box.Focused) continue;
+            string was = s.CurrentText;
+            if (box.Text != was) continue;
+            _hw.Refresh(s);
+            if (s.CurrentText != was) box.Text = s.CurrentText;
+        }
     }
 
     // ------------------------------------------------------------------ apply

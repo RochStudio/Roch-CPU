@@ -39,6 +39,8 @@ public sealed class HardwareModel : IDisposable
     public string SuperIoStatus { get; private set; } = "not probed";
     /// <summary>Base-clock control, when the board's clock generator is reachable. Null otherwise.</summary>
     public BclkController? BclkControl { get; private set; }
+    /// <summary>CPU VDD2 control, when the board's regulator is reachable. Null otherwise.</summary>
+    public Vdd2Rail? Vdd2 { get; private set; }
     public List<Ddr5Dimm> Dimms { get; } = new();
     public List<Setting> Settings { get; } = new();
 
@@ -151,12 +153,19 @@ public sealed class HardwareModel : IDisposable
                     // The clock generator sits on the EC's own I2C bus, so it is only reachable
                     // where that mailbox exists. Nothing is written here; the controller reads its
                     // baseline and does not touch the clock until a value is applied.
-                    if (EcClockGen.IsSupported(SuperIo) && Cpu is { } bclkCpu && Bclk is { IsAvailable: true } bclkMeter)
+                    if (EcMailbox.IsSupported(SuperIo))
                     {
-                        var control = new BclkController(new EcClockGen(SuperIo),
-                                                         () => bclkMeter.MeasureBclkFromCycles(bclkCpu.FirstPThread));
-                        if (control.CaptureBaseline()) { BclkControl = control; Emit("Clock generator: " + control.Status); }
-                        else Emit("Clock generator: " + control.Status);
+                        var mailbox = new EcMailbox(SuperIo);
+                        if (Cpu is { } bclkCpu && Bclk is { IsAvailable: true } bclkMeter)
+                        {
+                            var control = new BclkController(new EcClockGen(mailbox),
+                                                             () => bclkMeter.MeasureBclkFromCycles(bclkCpu.FirstPThread));
+                            if (control.CaptureBaseline()) BclkControl = control;
+                            Emit("Clock generator: " + control.Status);
+                        }
+                        var vdd2 = new Vdd2Rail(mailbox, () => SuperIo.ReadVoltage(Hardware.SuperIo.RailVdd2));
+                        if (vdd2.CaptureBaseline()) Vdd2 = vdd2;
+                        Emit("CPU VDD2: " + vdd2.Status);
                     }
                 }
             }
@@ -536,8 +545,43 @@ public sealed class HardwareModel : IDisposable
                 Read = () => sio.ReadVoltage(rail), Write = null, Note = note, Available = true
             });
         }
+        AddVdd2Row(sio);
         AddBoardRail("cpu_aux", "CPU AUX Voltage", Hardware.SuperIo.RailAux,
             "CPU AUX rail, measured at the board. It is produced by the motherboard VRM and has no CPU register, so it cannot be set from here - only from the BIOS or the board vendor's own tool.");
+    }
+
+    /// <summary>
+    /// CPU VDD2. Measured at the Super I/O either way; settable as well where the regulator on the
+    /// EC's I2C bus answers, which is what the vendor tool drives.
+    /// </summary>
+    private void AddVdd2Row(SuperIo sio)
+    {
+        if (sio.ReadVoltage(Hardware.SuperIo.RailVdd2) is not double v || v < 0.05) return;
+        var rail = Vdd2;
+        Settings.Add(new Setting
+        {
+            Id = "cpu_vdd2", Name = "CPU VDD2 Voltage", Group = SettingGroup.Board, Unit = "V",
+            Min = rail != null ? Vdd2Rail.MinVolts : 0,
+            Max = rail != null ? Vdd2Rail.MaxVolts : 5,
+            Decimals = 3,
+            Read = () => sio.ReadVoltage(Hardware.SuperIo.RailVdd2),
+            DefaultValue = rail?.BaselineVolts,
+            Write = rail == null ? null : t =>
+            {
+                if (!rail.SetVolts(t, Emit)) throw new InvalidOperationException(rail.Status);
+            },
+            RestoreDefault = rail == null ? null : () =>
+            {
+                if (!rail.Restore()) throw new InvalidOperationException(rail.Status);
+            },
+            Note = rail == null
+                ? "CPU VDD2 (the memory controller's supply), measured at the board through the Super I/O."
+                : "CPU VDD2, the memory controller's supply. Set on the board's regulator over the EC's I2C bus, one " +
+                  "step at a time, with the rail measured after each step; anything that lands off target puts back " +
+                  "the value found at start-up. The reading is the Super I/O's measurement of the rail, so it sits a " +
+                  "little below what the regulator was asked for. Enter 0 to put back the start-up value.",
+            Available = true
+        });
     }
 
     private void BuildDimms()
