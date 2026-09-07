@@ -76,6 +76,73 @@ internal static class Program
             return 0;
         }
 
+        if (args.Length > 0 && args[0].Equals("--cpu-bench", StringComparison.OrdinalIgnoreCase))
+        {
+            // Work actually completed per unit time, timed by the ACPI power-management timer.
+            // That crystal is independent of BCLK, the TSC and every performance counter, so this
+            // says how fast the core is really running without trusting any of them. If a BCLK
+            // change is real, the rate here moves with it.
+            using var hwC = new HardwareModel();
+            hwC.Initialize();
+            if (hwC.Cpu is not { } cpuC || hwC.Bclk is not { IsAvailable: true } meterC)
+            { Console.WriteLine("no CPU / timer"); return 1; }
+            Console.WriteLine("Work rate against two different clocks. The ACPI timer shares the platform");
+            Console.WriteLine("reference; the RTC has its own crystal and cannot be dragged by a BCLK change.");
+            for (int round = 0; round < 3; round++)
+            {
+                double acpi = meterC.MeasureWorkRate(cpuC.FirstPThread, 300);
+                double rtc = meterC.MeasureWorkRateRtc(cpuC.FirstPThread, 4);
+                var (ratio, _) = cpuC.ReadPerfStatus(cpuC.FirstPThread);
+                Console.WriteLine($"  ACPI-timed {acpi,9:0.000}   RTC-timed {rtc,9:0.000} Miter/s   ratio x{ratio}");
+            }
+            return 0;
+        }
+
+        if (args.Length > 0 && args[0].Equals("--bclk-watch", StringComparison.OrdinalIgnoreCase))
+        {
+            // One sample a second: enough to catch a BCLK change made by hand in another tool,
+            // and far too slow to bother the hardware.
+            using var hwW = new HardwareModel();
+            hwW.Initialize();
+            if (hwW.Cpu is not { } cpuW || hwW.Bclk is not { IsAvailable: true } meterW)
+            { Console.WriteLine("no CPU / BCLK meter"); return 1; }
+            int seconds = args.Length > 1 ? int.Parse(args[1], CultureInfo.InvariantCulture) : 60;
+            Console.WriteLine($"Watching BCLK for {seconds}s. Change it in the other tool now.");
+            Console.WriteLine("  time   TSC-based   core-based   ratio   core MHz");
+            var start = DateTime.UtcNow;
+            double? first = null;
+            while ((DateTime.UtcNow - start).TotalSeconds < seconds)
+            {
+                double tscB = meterW.MeasureBclkMHz(cpuW.BaseRatio, 40);
+                double? coreB = meterW.MeasureBclkFromCore(cpuW.FirstPThread, 120);
+                var (ratio, _) = cpuW.ReadPerfStatus(cpuW.FirstPThread);
+                first ??= coreB ?? tscB;
+                double now = coreB ?? tscB;
+                string flag = Math.Abs(now - first.Value) > 0.25 ? "   <-- CHANGED" : "";
+                Console.WriteLine($"  {(DateTime.UtcNow - start).TotalSeconds,4:0}s  {tscB,8:0.000}  {coreB,10:0.000}  {ratio,6}  {(coreB ?? tscB) * ratio,9:0}{flag}");
+                Thread.Sleep(700);
+            }
+            return 0;
+        }
+
+        if (args.Length > 0 && args[0].Equals("--bclk-test", StringComparison.OrdinalIgnoreCase))
+        {
+            using var hwB = new HardwareModel();
+            hwB.Initialize();
+            if (hwB.Cpu is not { } cpuB || hwB.Bclk is not { IsAvailable: true } meter)
+            { Console.WriteLine("no CPU / BCLK meter"); return 1; }
+            Console.WriteLine("Comparing the two ways of measuring BCLK.");
+            Console.WriteLine($"  base ratio {cpuB.BaseRatio}");
+            for (int i = 0; i < 3; i++)
+            {
+                double tscBased = meter.MeasureBclkMHz(cpuB.BaseRatio);
+                double? coreBased = meter.MeasureBclkFromCore(cpuB.FirstPThread);
+                double? cycleBased = meter.MeasureBclkFromCycles(cpuB.FirstPThread);
+                Console.WriteLine($"  TSC {tscBased,8:0.000}   APERF/MPERF {coreBased,8:0.000}   core cycles {cycleBased,8:0.000} MHz");
+            }
+            return 0;
+        }
+
         if (args.Length > 0 && args[0].Equals("--vcore-test", StringComparison.OrdinalIgnoreCase))
             return VcoreTest(args.Length > 1 ? args[1] : Path.Combine(AppContext.BaseDirectory, "vcore.txt"));
 

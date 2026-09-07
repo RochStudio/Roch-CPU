@@ -328,10 +328,9 @@ public sealed class HardwareModel : IDisposable
             Id = "bclk", Name = "Base Clock", Group = SettingGroup.Clocks, Min = 10, Max = 655.25, Decimals = 2,
             Read = () => LastBclk,
             Write = null,
-            Note = "Measured against the ACPI timer, so this is the real frequency rather than the programmed one. " +
-                   "Read-only: setting BCLK at runtime needs either an external clock generator on the SMBus or the Intel ICC over HECI, " +
-                   "and on a board with neither there is nothing to write. MSI's own tool shows an editable field here that does not " +
-                   "work either - measured on a Z790MPOWER, it accepted 101.00 while the rail stayed at 99.84 MHz.",
+            Note = "Real core clocks counted against the ACPI timer, so it tracks a BCLK change made anywhere - including " +
+                   "one made in the board vendor's tool while this is running. Read-only here: the write path goes through " +
+                   "the board's own clock generator, which is reached over a vendor-private bus.",
             Available = Bclk?.IsAvailable == true && BaseRatio > 0
         });
     }
@@ -728,13 +727,22 @@ public sealed class HardwareModel : IDisposable
         return watts;
     }
 
-    /// <summary>Blocking ~60 ms measurement; call from a background thread.</summary>
+    /// <summary>
+    /// Blocking measurement; call from a background thread.
+    ///
+    /// Counts real core clocks (CPU_CLK_UNHALTED.CORE) against the ACPI timer. The older
+    /// TSC-against-ACPI-timer method is only a fallback because it cannot see a BCLK change made
+    /// after boot: the TSC runs from a fixed crystal here, so it keeps reporting the boot-time
+    /// value however far BCLK is moved. Comparing against a vendor tool's live readback on a
+    /// Z790MPOWER at 101.00 MHz: cycle counting gives 101.02, the TSC method still says 99.84.
+    /// </summary>
     public double? MeasureBclk()
     {
         if (Bclk is not { IsAvailable: true } || BaseRatio == 0) return null;
         try
         {
-            LastBclk = Bclk.MeasureBclkMHz(BaseRatio);
+            int core = Cpu?.FirstPThread ?? 0;
+            LastBclk = Bclk.MeasureBclkFromCycles(core) ?? Bclk.MeasureBclkMHz(BaseRatio);
             return LastBclk;
         }
         catch (Exception ex) { Emit("BCLK measure failed: " + ex.Message); return null; }

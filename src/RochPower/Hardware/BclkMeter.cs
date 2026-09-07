@@ -106,6 +106,205 @@ public sealed class BclkMeter : IDisposable
         return MeasureTscHz(sampleMs) / baseRatio / 1_000_000.0;
     }
 
+    private const uint MSR_IA32_MPERF = 0xE7, MSR_IA32_APERF = 0xE8, MSR_IA32_PERF_STATUS = 0x198;
+
+    /// <summary>
+    /// BCLK measured from the core's own clock instead of the TSC.
+    ///
+    /// This exists because measuring the TSC is wrong on this platform. Since Skylake the TSC is
+    /// driven by a fixed reference and its rate does NOT follow a runtime BCLK change, so the
+    /// TSC method reports the boot-time BCLK for ever and silently misses every adjustment.
+    /// APERF/MPERF give the real core frequency as a ratio against the TSC, and dividing that by
+    /// the multiplier the core is actually running gives the true BCLK.
+    /// </summary>
+    public double? MeasureBclkFromCore(int cpuIndex, int sampleMs = 200)
+    {
+        if (!IsAvailable) return null;
+        double tscHz = MeasureTscHz(60, cpuIndex);
+        return WinRing0Driver.RunOnCpu(cpuIndex, () =>
+        {
+            var old = Thread.CurrentThread.Priority;
+            Thread.CurrentThread.Priority = ThreadPriority.Highest;
+            try
+            {
+                // Hold the core busy so it settles on a steady turbo ratio; an idle core parks at
+                // a low multiplier and the division below would then be against the wrong number.
+                double x = 1.0001;
+                var warm = Stopwatch.StartNew();
+                while (warm.ElapsedMilliseconds < 60) x = Math.Sqrt(x * 1.000001 + 1e-9);
+
+                if (!_drv.ReadMsr(MSR_IA32_APERF, out ulong a0) || !_drv.ReadMsr(MSR_IA32_MPERF, out ulong m0)) return (double?)null;
+                var ratios = new List<int>();
+                var sw = Stopwatch.StartNew();
+                while (sw.ElapsedMilliseconds < sampleMs)
+                {
+                    for (int i = 0; i < 20000; i++) x = Math.Sqrt(x * 1.000001 + 1e-9);
+                    if (_drv.ReadMsr(MSR_IA32_PERF_STATUS, out ulong ps)) ratios.Add((int)((ps >> 8) & 0xFF));
+                }
+                if (!_drv.ReadMsr(MSR_IA32_APERF, out ulong a1) || !_drv.ReadMsr(MSR_IA32_MPERF, out ulong m1)) return (double?)null;
+                GC.KeepAlive(x); // the busy loop must not be optimised away
+
+                double dA = a1 - a0, dM = m1 - m0;
+                if (dM <= 0 || dA <= 0 || ratios.Count == 0) return (double?)null;
+                double ratio = ratios.Average();
+                if (ratio < 4) return (double?)null;
+                double coreHz = tscHz * (dA / dM);
+                return coreHz / ratio / 1_000_000.0;
+            }
+            finally { Thread.CurrentThread.Priority = old; }
+        });
+    }
+
+    /// <summary>
+    /// Millions of fixed loop iterations completed per second, timed by the ACPI power-management
+    /// timer. That crystal runs at 3.579545 MHz regardless of BCLK, the TSC or any performance
+    /// counter, so this measures how fast the core is genuinely executing without trusting any of
+    /// them. Compare two runs: a real clock change moves this number proportionally.
+    /// </summary>
+    public double MeasureWorkRate(int cpuIndex, int sampleMs = 300)
+    {
+        uint mask = _timer32Bit ? 0xFFFFFFFF : 0xFFFFFF;
+        uint targetTicks = (uint)(PmTimerHz * sampleMs / 1000.0);
+        return WinRing0Driver.RunOnCpu(cpuIndex, () =>
+        {
+            var old = Thread.CurrentThread.Priority;
+            Thread.CurrentThread.Priority = ThreadPriority.Highest;
+            try
+            {
+                double x = 1.0001;
+                // warm up so the core is at its turbo ratio before the timed section
+                for (int i = 0; i < 3_000_000; i++) x = x * 1.0000001 + 1e-9;
+
+                uint p0 = ReadPmTimer();
+                long iterations = 0;
+                uint p1;
+                do
+                {
+                    for (int i = 0; i < 200_000; i++) x = x * 1.0000001 + 1e-9;
+                    iterations += 200_000;
+                    p1 = ReadPmTimer();
+                } while (((p1 - p0) & mask) < targetTicks);
+                GC.KeepAlive(x);
+                double seconds = ((p1 - p0) & mask) / PmTimerHz;
+                return iterations / seconds / 1_000_000.0;
+            }
+            finally { Thread.CurrentThread.Priority = old; }
+        });
+    }
+
+    private const uint IA32_FIXED_CTR1 = 0x30A, IA32_FIXED_CTR_CTRL = 0x38D, IA32_PERF_GLOBAL_CTRL = 0x38F;
+
+    /// <summary>
+    /// BCLK from the core's unhalted cycle counter, timed by the ACPI timer.
+    ///
+    /// The obvious measurements are all blind to a runtime BCLK change on this platform, which is
+    /// why they were wrong: the TSC runs from a fixed crystal and does not follow BCLK, and
+    /// MPERF increments in proportion to BCLK just as APERF does, so their ratio cancels. The
+    /// fixed-function counter CPU_CLK_UNHALTED.CORE counts real core clocks, so dividing it by
+    /// elapsed ACPI-timer seconds gives the true core frequency, and that over the running
+    /// multiplier is the true BCLK. The counter only advances while the core is unhalted, hence
+    /// the busy loop.
+    /// </summary>
+    public double? MeasureBclkFromCycles(int cpuIndex, int sampleMs = 150)
+    {
+        if (!IsAvailable) return null;
+        uint mask = _timer32Bit ? 0xFFFFFFFF : 0xFFFFFF;
+        uint targetTicks = (uint)(PmTimerHz * sampleMs / 1000.0);
+        return WinRing0Driver.RunOnCpu(cpuIndex, () =>
+        {
+            if (!_drv.ReadMsr(IA32_FIXED_CTR_CTRL, out ulong ctrlOld) ||
+                !_drv.ReadMsr(IA32_PERF_GLOBAL_CTRL, out ulong globalOld)) return (double?)null;
+            var old = Thread.CurrentThread.Priority;
+            Thread.CurrentThread.Priority = ThreadPriority.Highest;
+            try
+            {
+                // fixed counter 1 = CPU_CLK_UNHALTED.CORE; bits 7:4 are its control, OS+USR = 0x3
+                _drv.WriteMsr(IA32_FIXED_CTR_CTRL, (ctrlOld & ~0xF0UL) | 0x30UL);
+                _drv.WriteMsr(IA32_PERF_GLOBAL_CTRL, globalOld | (1UL << 33));
+
+                double x = 1.0001;
+                for (int i = 0; i < 500_000; i++) x = x * 1.0000001 + 1e-9;   // reach turbo
+
+                if (!_drv.ReadMsr(IA32_FIXED_CTR1, out ulong c0)) return (double?)null;
+                uint p0 = ReadPmTimer();
+                var ratios = new List<int>();
+                uint p1;
+                do
+                {
+                    for (int i = 0; i < 50_000; i++) x = x * 1.0000001 + 1e-9;
+                    if (_drv.ReadMsr(MSR_IA32_PERF_STATUS, out ulong ps)) ratios.Add((int)((ps >> 8) & 0xFF));
+                    p1 = ReadPmTimer();
+                } while (((p1 - p0) & mask) < targetTicks);
+                if (!_drv.ReadMsr(IA32_FIXED_CTR1, out ulong c1)) return (double?)null;
+                GC.KeepAlive(x);
+
+                double seconds = ((p1 - p0) & mask) / PmTimerHz;
+                double cycles = c1 - c0;
+                if (cycles <= 0 || seconds <= 0 || ratios.Count == 0) return (double?)null;
+                double ratio = ratios.Average();
+                if (ratio < 4) return (double?)null;
+                return cycles / seconds / ratio / 1_000_000.0;
+            }
+            finally
+            {
+                _drv.WriteMsr(IA32_PERF_GLOBAL_CTRL, globalOld);   // leave the counters as we found them
+                _drv.WriteMsr(IA32_FIXED_CTR_CTRL, ctrlOld);
+                Thread.CurrentThread.Priority = old;
+            }
+        });
+    }
+
+    private byte ReadCmos(byte reg) { _drv.WriteIoPortByte(0x70, reg); return _drv.ReadIoPortByte(0x71); }
+
+    /// <summary>Seconds from the RTC, read outside its update window so the value is settled.</summary>
+    private byte RtcSeconds()
+    {
+        var guard = Stopwatch.StartNew();
+        while ((ReadCmos(0x0A) & 0x80) != 0 && guard.ElapsedMilliseconds < 50) { }
+        return ReadCmos(0x00);
+    }
+
+    /// <summary>
+    /// Work rate timed against the real-time clock instead of the ACPI timer.
+    ///
+    /// This exists because the ACPI PM timer, the TSC and APERF/MPERF are not independent of each
+    /// other: on a board whose BCLK adjustment moves the shared platform reference, all three
+    /// scale together and a real clock change becomes invisible to every one of them. The RTC
+    /// runs from its own 32.768 kHz watch crystal on the battery circuit, so it cannot be dragged
+    /// along. If the core genuinely speeds up, the work done per RTC second rises with it.
+    /// </summary>
+    public double MeasureWorkRateRtc(int cpuIndex, int seconds = 6)
+    {
+        return WinRing0Driver.RunOnCpu(cpuIndex, () =>
+        {
+            var old = Thread.CurrentThread.Priority;
+            Thread.CurrentThread.Priority = ThreadPriority.Highest;
+            try
+            {
+                double x = 1.0001;
+                for (int i = 0; i < 3_000_000; i++) x = x * 1.0000001 + 1e-9; // reach turbo first
+
+                byte last = RtcSeconds();
+                var edge = Stopwatch.StartNew();
+                while (RtcSeconds() == last && edge.ElapsedMilliseconds < 2000) { }  // align to a tick
+                last = RtcSeconds();
+
+                long iterations = 0;
+                int ticks = 0;
+                while (ticks < seconds)
+                {
+                    for (int i = 0; i < 100_000; i++) x = x * 1.0000001 + 1e-9;
+                    iterations += 100_000;
+                    byte now = RtcSeconds();
+                    if (now != last) { last = now; ticks++; }
+                }
+                GC.KeepAlive(x);
+                return iterations / (double)ticks / 1_000_000.0;
+            }
+            finally { Thread.CurrentThread.Priority = old; }
+        });
+    }
+
     public void Dispose()
     {
         if (_code != IntPtr.Zero) Native.VirtualFree(_code, UIntPtr.Zero, Native.MEM_RELEASE);
