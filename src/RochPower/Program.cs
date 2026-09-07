@@ -54,8 +54,14 @@ internal static class Program
         {
             using var hw9 = new HardwareModel();
             hw9.Initialize();
-            var bus9 = hw9.Smbus;
-            if (bus9 == null) { Console.WriteLine("no SMBus"); return 1; }
+            if (hw9.Smbus is null) { Console.WriteLine("no SMBus"); return 1; }
+            // Recovery is Intel-specific: SSRESET lives in the PCH's HSTCFG register, and the
+            // AMD (PIIX4) controller has no equivalent.
+            if (hw9.Smbus is not SmbusI801 bus9)
+            {
+                Console.WriteLine($"SMBus recovery is only implemented for the Intel PCH controller; this system has {hw9.Smbus.Description}.");
+                return 1;
+            }
             Console.WriteLine("soft reset : " + bus9.Reset());
             Console.WriteLine("host reset : " + bus9.HardReset());
             for (int attempt = 1; attempt <= 3; attempt++)
