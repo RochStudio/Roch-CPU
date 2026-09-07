@@ -37,6 +37,8 @@ public sealed class HardwareModel : IDisposable
     public ISmbus? Smbus { get; private set; }
     public SuperIo? SuperIo { get; private set; }
     public string SuperIoStatus { get; private set; } = "not probed";
+    /// <summary>Base-clock control, when the board's clock generator is reachable. Null otherwise.</summary>
+    public BclkController? BclkControl { get; private set; }
     public List<Ddr5Dimm> Dimms { get; } = new();
     public List<Setting> Settings { get; } = new();
 
@@ -145,6 +147,17 @@ public sealed class HardwareModel : IDisposable
                 {
                     var rails = SuperIo.ReadRails();
                     Emit("Board rails: " + (rails.Count == 0 ? "none readable" : string.Join(", ", rails.Select(r => $"{r.Name} {r.Volts:0.000} V"))));
+
+                    // The clock generator sits on the EC's own I2C bus, so it is only reachable
+                    // where that mailbox exists. Nothing is written here; the controller reads its
+                    // baseline and does not touch the clock until a value is applied.
+                    if (EcClockGen.IsSupported(SuperIo) && Cpu is { } bclkCpu && Bclk is { IsAvailable: true } bclkMeter)
+                    {
+                        var control = new BclkController(new EcClockGen(SuperIo),
+                                                         () => bclkMeter.MeasureBclkFromCycles(bclkCpu.FirstPThread));
+                        if (control.CaptureBaseline()) { BclkControl = control; Emit("Clock generator: " + control.Status); }
+                        else Emit("Clock generator: " + control.Status);
+                    }
                 }
             }
             catch (Exception ex) { Emit("Super I/O error: " + ex.Message); }
@@ -323,14 +336,34 @@ public sealed class HardwareModel : IDisposable
 
     private void AddBclkRow()
     {
+        var control = BclkControl;
         Settings.Add(new Setting
         {
-            Id = "bclk", Name = "Base Clock", Group = SettingGroup.Clocks, Min = 10, Max = 655.25, Decimals = 2,
+            Id = "bclk", Name = "Base Clock", Group = SettingGroup.Clocks,
+            Min = control != null ? BclkController.MinBclkMHz : 10,
+            Max = control != null ? BclkController.MaxBclkMHz : 655.25,
+            Decimals = 2,
             Read = () => LastBclk,
-            Write = null,
-            Note = "Real core clocks counted against the ACPI timer, so it tracks a BCLK change made anywhere - including " +
-                   "one made in the board vendor's tool while this is running. Read-only here: the write path goes through " +
-                   "the board's own clock generator, which is reached over a vendor-private bus.",
+            DefaultValue = control?.BaselineMHz,
+            Write = control == null ? null : v =>
+            {
+                if (!control.SetBclk(v, Emit)) throw new InvalidOperationException(control.Status);
+                MeasureBclk();
+            },
+            RestoreDefault = control == null ? null : () =>
+            {
+                if (!control.Restore()) throw new InvalidOperationException(control.Status);
+                MeasureBclk();
+            },
+            Note = control == null
+                ? "Real core clocks counted against the ACPI timer, so it tracks a BCLK change made anywhere - including " +
+                  "one made in the board vendor's tool while this is running. Read-only here: the write path goes through " +
+                  "the board's own clock generator, which is only reachable where the board's EC exposes it."
+                : "Set through the board's clock generator, over the EC's own I2C bus. Every step is measured against the " +
+                  "ACPI timer, which does not move with the base clock, and anything that lands off target puts back the " +
+                  "value found at start-up. The range is about a MHz wide - the generator's fine trim - and is measured on " +
+                  $"first use; {BclkController.MaxBclkMHz:0.0} MHz is a hard ceiling. Base clock scales memory and the ring " +
+                  "with it, so small changes go a long way. Enter 0 to put back the start-up value.",
             Available = Bclk?.IsAvailable == true && BaseRatio > 0
         });
     }

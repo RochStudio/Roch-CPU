@@ -255,6 +255,24 @@ public sealed class SuperIo : IDisposable
 
     public double? ReadVcore() => ReadVoltage(VcoreIndex);
 
+    /// <summary>Single raw EC-space read, for protocol diagnostics. Rate-limit the caller, not this.</summary>
+    public byte ReadRaw(ushort address) => WithLock(() => ReadByteRaw(address), (byte)0);
+
+    /// <summary>Single raw EC-space write. Only the vendor-command path uses this.</summary>
+    public bool WriteRaw(ushort address, byte value) => WithLock(() =>
+    {
+        if (Kind != SuperIoKind.NuvotonEc) return false;
+        byte page = (byte)(address >> 8), index = (byte)(address & 0xFF);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (_drv.ReadIoPortByte((ushort)(_base + EC_PAGE)) != EC_PAGE_FREE && sw.ElapsedMilliseconds < 200) Thread.Sleep(1);
+        _drv.WriteIoPortByte((ushort)(_base + EC_PAGE), EC_PAGE_FREE);
+        _drv.WriteIoPortByte((ushort)(_base + EC_PAGE), page);
+        _drv.WriteIoPortByte((ushort)(_base + EC_INDEX), index);
+        _drv.WriteIoPortByte((ushort)(_base + EC_DATA), value);
+        _drv.WriteIoPortByte((ushort)(_base + EC_PAGE), EC_PAGE_FREE);
+        return true;
+    }, false);
+
     /// <summary>The rails whose wiring is known on this board; empty on families where it is not.</summary>
     public List<BoardRail> ReadRails()
     {

@@ -76,6 +76,17 @@ PMIC over SMBus).
 Dragon Power was used as a reference implementation for behaviour comparison on one MSI board,
 which is how the DDR5 PMIC voltage scales and the OC mailbox domain numbering were validated.
 
+The base-clock path in `Hardware/EcClockGen.cs` was found by observing that tool's behaviour: its
+kernel driver's exported entry points were forwarded through a logging proxy while it changed the
+base clock, and the resulting port-level trace showed which registers of the board's embedded
+controller carry a transaction to the clock generator on the controller's own I2C bus. What was
+taken from this is an interface description - register addresses and a handshake - which is the
+same class of fact as a datasheet, obtained by watching hardware rather than by reading or
+translating any of the vendor's code; none of that code was disassembled and none of it is
+included here. The frequency encoding itself was not taken from the observation at all: reading it
+off the trace gives the wrong answer, and it was established by measuring the resulting clock, as
+`EcClockGen` and `BclkController` document.
+
 ## The Roch mark
 
 The `assets/` artwork is shared with [Roch GPU](https://github.com/RochStudio/Roch-GPU) and

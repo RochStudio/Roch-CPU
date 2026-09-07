@@ -76,6 +76,119 @@ internal static class Program
             return 0;
         }
 
+        if (args.Length > 0 && args[0].Equals("--ec-restore", StringComparison.OrdinalIgnoreCase))
+        {
+            // Puts the vendor command block back to the idle state seen in the capture: no
+            // pending parameter, doorbell clear.
+            using var hwR = new HardwareModel();
+            hwR.Initialize();
+            if (hwR.SuperIo is not { Kind: SuperIoKind.NuvotonEc } sioR) { Console.WriteLine("no EC"); return 1; }
+            Console.WriteLine($"before: 0x463=0x{sioR.ReadRaw(0x463):X2}  0x470=0x{sioR.ReadRaw(0x470):X2}");
+            sioR.WriteRaw(0x470, 0x00);
+            sioR.WriteRaw(0x463, (byte)(sioR.ReadRaw(0x463) & 0x7F));   // clear the doorbell bit only
+            Thread.Sleep(300);
+            Console.WriteLine($"after : 0x463=0x{sioR.ReadRaw(0x463):X2}  0x470=0x{sioR.ReadRaw(0x470):X2}");
+            return 0;
+        }
+
+        if (args.Length > 0 && args[0].Equals("--bclk-step", StringComparison.OrdinalIgnoreCase))
+        {
+            // Replays the exact sequence captured from the vendor tool's BCLK ramp: stage a
+            // parameter at 0x470, ring the doorbell (bit 7 of the command byte at 0x463), wait
+            // for the EC to clear it. Measures BCLK either side so a step that does nothing - or
+            // does something unexpected - is visible immediately.
+            using var hwS = new HardwareModel();
+            hwS.Initialize();
+            if (hwS.SuperIo is not { Kind: SuperIoKind.NuvotonEc } sioS || hwS.Cpu is not { } cpuS
+                || hwS.Bclk is not { IsAvailable: true } meterS)
+            { Console.WriteLine("needs the Nuvoton EC and a working BCLK meter"); return 1; }
+            byte param = args.Length > 1 ? Convert.ToByte(args[1], 16) : (byte)0x01;
+
+            double? before = meterS.MeasureBclkFromCycles(cpuS.FirstPThread);
+            byte cmd = sioS.ReadRaw(0x463);
+            Console.WriteLine($"before: BCLK {before:0.000} MHz, 0x463=0x{cmd:X2}, 0x470=0x{sioS.ReadRaw(0x470):X2}");
+            if ((cmd & 0x80) != 0) { Console.WriteLine("EC busy (doorbell already set) - not touching it"); return 1; }
+
+            sioS.WriteRaw(0x470, param);
+            sioS.WriteRaw(0x463, (byte)(cmd | 0x80));
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while ((sioS.ReadRaw(0x463) & 0x80) != 0 && sw.ElapsedMilliseconds < 2000) Thread.Sleep(20);
+            bool acked = (sioS.ReadRaw(0x463) & 0x80) == 0;
+            Console.WriteLine($"doorbell {(acked ? $"acknowledged in {sw.ElapsedMilliseconds} ms" : "NOT acknowledged")}; 0x470 now 0x{sioS.ReadRaw(0x470):X2}");
+
+            Thread.Sleep(400);
+            double? after = meterS.MeasureBclkFromCycles(cpuS.FirstPThread);
+            Console.WriteLine($"after : BCLK {after:0.000} MHz   delta {(after - before) * 1000:+0;-0} kHz");
+            return 0;
+        }
+
+        if (args.Length > 0 && args[0].Equals("--ec-capture", StringComparison.OrdinalIgnoreCase))
+        {
+            // Deliberately slow. An earlier version of this polled the EC as fast as the LPC path
+            // allowed (~27,000 reads/s) and hard-reset the machine twice, because that chip also
+            // runs fan control and power sequencing. This does 24 registers ten times a second -
+            // about 240 reads/s, roughly what ordinary sensor polling costs - which is ample when
+            // the thing being watched steps once per second.
+            using var hwE = new HardwareModel();
+            hwE.Initialize();
+            if (hwE.SuperIo is not { } sioE) { Console.WriteLine("no Super I/O"); return 1; }
+            if (sioE.Kind != SuperIoKind.NuvotonEc) { Console.WriteLine($"{sioE.Name} has no EC address space"); return 1; }
+            int seconds = args.Length > 1 ? int.Parse(args[1], CultureInfo.InvariantCulture) : 15;
+            const ushort first = 0x460, last = 0x477;
+            int n = last - first + 1;
+            var prev = new byte[n];
+            for (int i = 0; i < n; i++) prev[i] = sioE.ReadRaw((ushort)(first + i));
+            Console.WriteLine($"Watching EC 0x{first:X3}-0x{last:X3} at 10 Hz for {seconds}s.");
+            Console.WriteLine("baseline " + string.Join(" ", prev.Select(b => b.ToString("X2"))));
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (sw.Elapsed.TotalSeconds < seconds)
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    byte v = sioE.ReadRaw((ushort)(first + i));
+                    if (v != prev[i])
+                    {
+                        Console.WriteLine($"{sw.Elapsed.TotalMilliseconds,9:0} ms  0x{first + i:X3}: {prev[i]:X2} -> {v:X2}");
+                        prev[i] = v;
+                    }
+                }
+                Thread.Sleep(100);
+            }
+            Console.WriteLine("done");
+            return 0;
+        }
+
+        if (args.Length > 0 && args[0].Equals("--sio-ldn", StringComparison.OrdinalIgnoreCase))
+        {
+            // Enumerate the Super I/O's logical devices and their I/O windows. Plain config-space
+            // reads with the documented unlock/lock sequence - no polling, nothing written.
+            using var hwL = new HardwareModel();
+            hwL.Initialize();
+            if (hwL.Driver is not { } drvL) { Console.WriteLine("no driver"); return 1; }
+            foreach (ushort port in new ushort[] { 0x2E, 0x4E })
+            {
+                ushort val = (ushort)(port + 1);
+                byte Rd(byte reg) { drvL.WriteIoPortByte(port, reg); return drvL.ReadIoPortByte(val); }
+                void Wr(byte reg, byte v) { drvL.WriteIoPortByte(port, reg); drvL.WriteIoPortByte(val, v); }
+                drvL.WriteIoPortByte(port, 0x87); drvL.WriteIoPortByte(port, 0x87);
+                byte id = Rd(0x20), rev = Rd(0x21);
+                if (id == 0xFF || (id == 0 && rev == 0)) { drvL.WriteIoPortByte(port, 0xAA); continue; }
+                Console.WriteLine($"LPC 0x{port:X2}: chip 0x{id:X2}{rev:X2}");
+                for (int ldn = 0; ldn <= 0x1F; ldn++)
+                {
+                    Wr(0x07, (byte)ldn);
+                    byte active = Rd(0x30);
+                    ushort b0 = (ushort)((Rd(0x60) << 8) | Rd(0x61));
+                    ushort b1 = (ushort)((Rd(0x62) << 8) | Rd(0x63));
+                    if (active == 0xFF && b0 == 0xFFFF) continue;
+                    if (active == 0 && b0 == 0 && b1 == 0) continue;
+                    Console.WriteLine($"   LDN 0x{ldn:X2}  active={active:X2}  base0=0x{b0:X4}  base1=0x{b1:X4}");
+                }
+                drvL.WriteIoPortByte(port, 0xAA);
+            }
+            return 0;
+        }
+
         if (args.Length > 0 && args[0].Equals("--cpu-bench", StringComparison.OrdinalIgnoreCase))
         {
             // Work actually completed per unit time, timed by the ACPI power-management timer.
@@ -141,6 +254,91 @@ internal static class Program
                 Console.WriteLine($"  TSC {tscBased,8:0.000}   APERF/MPERF {coreBased,8:0.000}   core cycles {cycleBased,8:0.000} MHz");
             }
             return 0;
+        }
+
+        if (args.Length > 0 && args[0].Equals("--clkgen", StringComparison.OrdinalIgnoreCase))
+        {
+            using var hwC = new HardwareModel();
+            hwC.Log += m => Console.Error.WriteLine(m);
+            hwC.Initialize();
+            Console.WriteLine(hwC.SuperIoStatus);
+            if (!EcClockGen.IsSupported(hwC.SuperIo)) { Console.WriteLine("no EC mailbox on this Super I/O"); return 1; }
+            var gen = new EcClockGen(hwC.SuperIo!);
+            for (int i = 0; i < 3; i++)
+            {
+                var blk = gen.ReadBlock();
+                double? mhz = hwC.Cpu is { } c && hwC.Bclk is { IsAvailable: true } m ? m.MeasureBclkFromCycles(c.FirstPThread) : null;
+                Console.WriteLine(blk is null
+                    ? "  clock generator did not answer"
+                    : $"  {EcClockGen.Describe(blk)}   measured {mhz:0.000} MHz");
+            }
+            return 0;
+        }
+
+        if (args.Length > 0 && (args[0].Equals("--bclk-cal", StringComparison.OrdinalIgnoreCase)
+                                || args[0].Equals("--bclk-probe", StringComparison.OrdinalIgnoreCase)
+                                || args[0].Equals("--clkgen-dump", StringComparison.OrdinalIgnoreCase)
+                                || args[0].Equals("--bclk-set", StringComparison.OrdinalIgnoreCase)))
+        {
+            using var hwK = new HardwareModel();
+            hwK.Log += m => Console.Error.WriteLine(m);
+            hwK.Initialize();
+            if (!EcClockGen.IsSupported(hwK.SuperIo)) { Console.WriteLine("no EC mailbox on this Super I/O"); return 1; }
+            if (hwK.Cpu is not { } cpuK || hwK.Bclk is not { IsAvailable: true } meterK)
+            { Console.WriteLine("no BCLK meter"); return 1; }
+
+            var ctl = new BclkController(new EcClockGen(hwK.SuperIo!), () => meterK.MeasureBclkFromCycles(cpuK.FirstPThread));
+            if (!ctl.CaptureBaseline()) { Console.WriteLine(ctl.Status); return 1; }
+            Console.WriteLine(ctl.Status);
+
+            if (args[0].Equals("--clkgen-dump", StringComparison.OrdinalIgnoreCase))
+            {
+                // Read-only sweep of the clock generator, to find what else on it moves with the
+                // base clock. Word reads overlap by a byte, so the low byte of each is the map.
+                var genD = new EcClockGen(hwK.SuperIo!);
+                int fromD = args.Length > 1 ? Convert.ToInt32(args[1], 16) : 0x00;
+                int toD = args.Length > 2 ? Convert.ToInt32(args[2], 16) : 0xFF;
+                Console.WriteLine($"clock generator 0x{EcClockGen.ClockGenAddress:X2}, registers 0x{fromD:X2}-0x{toD:X2}");
+                for (int b = fromD & ~0xF; b <= toD; b += 16)
+                {
+                    var cells = new List<string>();
+                    for (int i = 0; i < 16; i++)
+                    {
+                        int r = b + i;
+                        cells.Add(r < fromD || r > toD ? "  "
+                            : genD.ReadWord(EcClockGen.ClockGenAddress, (byte)r) is ushort wv ? $"{(byte)wv:X2}" : "--");
+                    }
+                    Console.WriteLine($"  {b:X2}: {string.Join(" ", cells)}");
+                }
+                return 0;
+            }
+
+            if (args[0].Equals("--bclk-probe", StringComparison.OrdinalIgnoreCase))
+            {
+                // Dividers spread across the range, including two that cross an integer boundary,
+                // which is where the half-written-divider case shows up if the write order is wrong.
+                var divs = new[] { 100.0, 99.5, 99.0, 98.98, 98.5, 98.02 };
+                if (args.Length > 1)
+                    divs = args.Skip(1).Select(a => double.Parse(a, System.Globalization.CultureInfo.InvariantCulture)).ToArray();
+                bool okP = ctl.ProbeDividers(divs, Console.WriteLine);
+                Console.WriteLine((okP ? "" : "FAILED: ") + ctl.Status);
+                return okP ? 0 : 1;
+            }
+
+            if (args[0].Equals("--bclk-cal", StringComparison.OrdinalIgnoreCase))
+            {
+                bool ok = ctl.Calibrate(Console.WriteLine);
+                Console.WriteLine((ok ? "calibrated: " : "FAILED: ") + ctl.Status);
+                return ok ? 0 : 1;
+            }
+
+            if (args.Length < 2 || !double.TryParse(args[1], System.Globalization.CultureInfo.InvariantCulture, out double want))
+            { Console.WriteLine("usage: --bclk-set <MHz>"); return 1; }
+            if (!ctl.Calibrate(Console.WriteLine)) { Console.WriteLine("FAILED: " + ctl.Status); return 1; }
+            Console.WriteLine("calibrated: " + ctl.Status);
+            bool set = ctl.SetBclk(want, Console.WriteLine);
+            Console.WriteLine((set ? "ok: " : "FAILED: ") + ctl.Status);
+            return set ? 0 : 1;
         }
 
         if (args.Length > 0 && args[0].Equals("--vcore-test", StringComparison.OrdinalIgnoreCase))
