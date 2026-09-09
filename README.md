@@ -31,7 +31,7 @@ Controls vary by processor, motherboard, BIOS and driver access. Optional [PawnI
   <img src="screenshot-amd.png" alt="Roch CPU AMD Ryzen tuning controls" width="360">
 </p>
 
-Intel and AMD examples from earlier builds. Version 1.0.2 uses the updated grouped layout and adds light mode; available rows still follow the detected hardware.
+Left: Intel example from an earlier build. Right: Roch CPU 1.0.2 on an AMD Ryzen 7 9850X3D, showing the current grouped layout. Available rows follow the detected hardware. Displayed settings are examples, not tuning recommendations.
 
 ## Build the latest source
 
