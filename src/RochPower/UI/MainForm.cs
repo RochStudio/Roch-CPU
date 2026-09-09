@@ -7,7 +7,7 @@ namespace RochPower.UI;
 public sealed class MainForm : Form
 {
     public const string AppName = "Roch CPU";
-    public const string AppVersion = "1.0.1";
+    public const string AppVersion = "1.0.2";
     private const int ResizeBorder = 6;
 
     private readonly HardwareModel _hw = new();
@@ -20,6 +20,7 @@ public sealed class MainForm : Form
     private readonly Label _lblBios = Theme.Muted_("");
     private readonly Label _lblWarn = Theme.Label("", Theme.Small, Theme.Warn);
     private readonly Button _btnLog = Theme.Button("Log");
+    private readonly Button _btnTheme = Theme.Button(Theme.IsDark ? "Light" : "Dark");
     private readonly Button _btnPerCore = Theme.Button("Per-Core Ratio Table");
     private readonly Button _btnAuto = Theme.Button("Start");
     private TextBox _txtAutoStep = null!, _txtAutoInterval = null!;
@@ -42,7 +43,6 @@ public sealed class MainForm : Form
     private bool _bclkBusy;
     /// <summary>Set while an apply is running on a worker, so nothing else touches the hardware.</summary>
     private bool _applying;
-    private int _rowIndex;
 
     public MainForm()
     {
@@ -54,7 +54,7 @@ public sealed class MainForm : Form
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(600, 420);
-        Size = new Size(620, 760);
+        Size = new Size(660, 800);
         KeyPreview = true;
         DoubleBuffered = true;
 
@@ -81,7 +81,7 @@ public sealed class MainForm : Form
         var brand = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, Location = new Point(8, 0), Height = 30, BackColor = Color.Transparent };
         var mark = Theme.LoadMark(20);
         if (mark != null) brand.Controls.Add(new PictureBox { Image = mark, Size = new Size(20, 20), Margin = new Padding(0, 5, 6, 0), BackColor = Color.Transparent });
-        var roch = Theme.Label("Roch", Theme.Brand, Theme.Accent); roch.Margin = new Padding(0, 6, 0, 0);
+        var roch = Theme.Label("Roch", Theme.Brand, Theme.Text); roch.Margin = new Padding(0, 6, 0, 0);
         var cpu = Theme.Label($"CPU {AppVersion}", Theme.Brand, Theme.Text); cpu.Margin = new Padding(4, 6, 0, 0);
         brand.Controls.Add(roch); brand.Controls.Add(cpu);
         title.Controls.Add(brand);
@@ -113,8 +113,19 @@ public sealed class MainForm : Form
         _btnLog.Font = Theme.Small; _btnLog.AutoSize = false; _btnLog.Width = 48; _btnLog.Height = 24; _btnLog.Padding = new Padding(0); _btnLog.Margin = new Padding(0, 2, 0, 0);
         _btnLog.Click += (_, _) => ToggleLog();
         header.Controls.Add(_lblCpu, 0, 0);
-        header.Controls.Add(_btnLog, 1, 0);
-        header.SetRowSpan(_btnLog, 2);
+        var headerButtons = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, Margin = new Padding(0) };
+        _btnLog.Width = 64;
+        _btnTheme.Font = Theme.Small; _btnTheme.AutoSize = false; _btnTheme.Size = new Size(64, 24); _btnTheme.Padding = new Padding(0); _btnTheme.Margin = new Padding(6, 2, 0, 0);
+        _btnTheme.Click += (_, _) =>
+        {
+            try { Theme.Toggle(this, _logForm); }
+            catch (Exception ex) { AppendLog("Theme preference could not be saved: " + ex.Message); }
+            _btnTheme.Text = Theme.IsDark ? "Light" : "Dark";
+        };
+        headerButtons.Controls.Add(_btnLog);
+        headerButtons.Controls.Add(_btnTheme);
+        header.Controls.Add(headerButtons, 1, 0);
+        header.SetRowSpan(headerButtons, 2);
         _lblCores.Margin = new Padding(0, 2, 0, 0);
         _lblBoard.Margin = new Padding(0, 2, 0, 0);
         _lblBios.Margin = new Padding(0, 2, 0, 0);
@@ -154,12 +165,14 @@ public sealed class MainForm : Form
 
         // apply / revert / reset
         var applyRow = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 3, BackColor = Theme.Bg, Margin = new Padding(0, 8, 0, 0) };
-        applyRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        applyRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        applyRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        applyRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 34));
+        applyRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33));
+        applyRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33));
         _btnApply.Dock = DockStyle.Fill; _btnApply.AutoSize = false; _btnApply.Height = 32; _btnApply.Margin = new Padding(0, 0, 6, 0);
         _btnRevert.Height = 32; _btnRevert.AutoSize = false; _btnRevert.Width = 80; _btnRevert.Padding = new Padding(0); _btnRevert.Margin = new Padding(0, 0, 6, 0);
         _btnReset.Height = 32; _btnReset.AutoSize = false; _btnReset.Width = 72; _btnReset.Padding = new Padding(0); _btnReset.Margin = new Padding(0);
+        _btnRevert.Dock = DockStyle.Fill; _btnReset.Dock = DockStyle.Fill;
+        _btnApply.Height = _btnRevert.Height = _btnReset.Height = 38;
         _btnApply.Click += (_, _) => ApplyAll();
         _btnRevert.Click += (_, _) => RefreshRows("Reverted the fields to what the hardware reports.");
         _btnReset.Click += (_, _) => RestoreDefaults();
@@ -180,13 +193,15 @@ public sealed class MainForm : Form
         {
             Text = Theme.Author, LinkColor = Theme.Accent, ActiveLinkColor = Theme.Warn, VisitedLinkColor = Theme.Accent,
             LinkBehavior = LinkBehavior.NeverUnderline, Font = Theme.Bold, AutoSize = true,
-            BackColor = Color.Transparent, Cursor = Cursors.Hand, Margin = new Padding(6, 0, 0, 0)
+            BackColor = Color.Transparent, Cursor = Cursors.Hand, Margin = new Padding(0, 5, 0, 0)
         };
         author.LinkClicked += (_, _) => { try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(Theme.AuthorUrl) { UseShellExecute = true }); } catch { } };
         author.MouseEnter += (_, _) => author.LinkColor = Theme.Warn;
         author.MouseLeave += (_, _) => author.LinkColor = Theme.Accent;
         new ToolTip().SetToolTip(author, Theme.AuthorUrl);
-        status.Controls.Add(author, 1, 0);
+        status.Controls.Add(author, 0, 1);
+        status.SetColumnSpan(_lblStatus, 2);
+        status.SetColumnSpan(author, 2);
         _body.Controls.Add(status, 0, 4);
 
         Resize += (_, _) =>
@@ -201,11 +216,12 @@ public sealed class MainForm : Form
     private void BuildRows()
     {
         _rows.SuspendLayout();
+        foreach (Control old in _rows.Controls.Cast<Control>().ToArray()) old.Dispose();
         _rows.Controls.Clear();
         _rows.RowStyles.Clear();
         _boxes.Clear(); _statusLabels.Clear(); _rangeLabels.Clear();
-        _rowIndex = 0;
         SettingGroup? last = null;
+        TableLayoutPanel? section = null;
         foreach (var s in _hw.Settings)
         {
             // Unavailable rows are hidden rather than shown greyed out: it keeps everything on screen
@@ -215,25 +231,47 @@ public sealed class MainForm : Form
             if (s.Group != last)
             {
                 last = s.Group;
-                _rows.Controls.Add(Theme.SectionTitle(s.Group switch
+                section = new TableLayoutPanel
+                {
+                    AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                    ColumnCount = 1, Dock = DockStyle.Top, BackColor = Theme.Bg,
+                    Padding = new Padding(10, 5, 10, 6), Margin = new Padding(0, 0, 0, 8)
+                };
+                section.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+                section.Paint += (_, e) =>
+                {
+                    var panel = (Control)_!;
+                    using var pen = new Pen(Theme.Border);
+                    e.Graphics.DrawRectangle(pen, 0, 0, panel.Width - 1, panel.Height - 1);
+                };
+                var heading = Theme.SectionTitle(s.Group switch
                 {
                     SettingGroup.Clocks => "Clocks", SettingGroup.Voltages => "Voltages (FIVR / OC mailbox)",
-                    SettingGroup.Power => _hw.IsAmd ? "Power and current limits (SMU)" : "Power limits",
-                    SettingGroup.Pbo => "Precision Boost Overdrive (SMU)",
-                    SettingGroup.Memory => "DDR5 memory (PMIC)",
+                    SettingGroup.Power => "Power",
+                    SettingGroup.Pbo => "Precision Boost",
+                    SettingGroup.Memory => "Memory",
                     SettingGroup.Board => "Board VRM rails (measured)", _ => ""
-                }));
+                });
+                heading.Margin = new Padding(0, 0, 0, 4);
+                section.Controls.Add(heading);
+                section.Controls.Add(Theme.Rule());
+                _rows.Controls.Add(section);
             }
 
             // Alternating row shading, the way Roch Viewer's tables read.
-            var rowBack = (_rowIndex++ % 2 == 0) ? Theme.Bg : Theme.PanelAlt;
+            var rowBack = Theme.Bg;
             var row = new TableLayoutPanel { AutoSize = true, ColumnCount = 4, Dock = DockStyle.Top, BackColor = rowBack, Margin = new Padding(0) };
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 225));
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 84));
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 40));
             row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
-            var name = Theme.Label(s.Name, Theme.Row, Theme.Text);
+            var displayName = s.Name.Replace(" (Package Power Tracking)", "").Replace(" (Thermal Design Current)", "")
+                .Replace(" (Electrical Design Current)", "").Replace(" (Tctl max)", "")
+                .Replace(" (all cores)", "").Replace("DRAM ", "").Replace(" Voltage", "");
+            var name = Theme.Label(displayName, Theme.Row, Theme.Text);
+            if (s.Group == SettingGroup.Memory && !displayName.Contains("VDDQ") && !displayName.Contains("VPP")) name.Text += " VDD";
+            name.MaximumSize = new Size(220, 0);
             name.Margin = new Padding(6, 5, 0, 5);
             var range = Theme.Muted_(s.ReadOnly ? "read-only" : s.RangeText);
             range.Margin = new Padding(8, 6, 8, 0);
@@ -246,11 +284,12 @@ public sealed class MainForm : Form
             var unit = Theme.Muted_(s.Unit); unit.Margin = new Padding(4, 6, 0, 0); unit.Width = 34; unit.AutoSize = false;
 
             row.Controls.Add(name, 0, 0);
-            row.Controls.Add(range, 1, 0);
-            row.Controls.Add(frame, 2, 0);
-            row.Controls.Add(unit, 3, 0);
+            row.Controls.Add(frame, 1, 0);
+            row.Controls.Add(unit, 2, 0);
+            range.Dock = DockStyle.Fill; range.AutoSize = false; range.AutoEllipsis = true;
+            row.Controls.Add(range, 3, 0);
             if (s.Note != null) { var tip = new ToolTip { AutoPopDelay = 20000 }; tip.SetToolTip(name, s.Note); tip.SetToolTip(box, s.Note); tip.SetToolTip(range, s.Note); }
-            _rows.Controls.Add(row);
+            section!.Controls.Add(row);
             _boxes[s] = box; _statusLabels[s] = range; _rangeLabels[s] = range;
         }
         _rows.ResumeLayout();
@@ -310,7 +349,7 @@ public sealed class MainForm : Form
             _lblCpu.Text = "No CPU access";
             _lblCores.Text = _hw.DriverStatus;
         }
-        _lblBoard.Text = sm.MainboardModel;
+        _lblBoard.Text = string.IsNullOrWhiteSpace(sm.BoardProduct) ? sm.SystemProduct : sm.BoardProduct;
         _lblBios.Text = $"BIOS {sm.BiosVersion}";
 
         var warns = new List<string>();

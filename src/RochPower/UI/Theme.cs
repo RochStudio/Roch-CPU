@@ -8,24 +8,78 @@ namespace RochPower.UI;
 /// </summary>
 public static class Theme
 {
+    public static bool IsDark { get; private set; } = LoadDark();
+    private static string PreferencePath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Roch CPU", "theme.txt");
+    private static bool LoadDark() { try { return File.ReadAllText(PreferencePath).Trim() != "light"; } catch { return true; } }
+    private static Color Tone(string dark, string light) => ColorTranslator.FromHtml(IsDark ? dark : light);
     // Palette shared with Roch Viewer's dark theme, taken from its own constants so the two
     // tools read as one family rather than merely similar.
-    public static readonly Color Bg = ColorTranslator.FromHtml("#101010");        // BG_COLOR
-    public static readonly Color Panel = ColorTranslator.FromHtml("#161616");     // BG_COLOR2 / SECTION_COLOR
-    public static readonly Color PanelAlt = ColorTranslator.FromHtml("#1A1A1A");  // ROW_COLOR
-    public static readonly Color Header = ColorTranslator.FromHtml("#1C1C1C");    // HEADER_COLOR
+    public static Color Bg => Tone("#101010", "#F1F5F9");
+    public static Color Panel => Tone("#161616", "#FFFFFF");
+    public static Color PanelAlt => Tone("#1A1A1A", "#E8EEF5");
+    public static Color Header => Tone("#1C1C1C", "#E2E8F0");
     /// <summary>Title bar: a grey strip above the black body, as in Roch Viewer.</summary>
-    public static readonly Color TitleBar = ColorTranslator.FromHtml("#1C1C1C");
-    public static readonly Color Highlight = ColorTranslator.FromHtml("#171717"); // HIGHLIGHT_COLOR
-    public static readonly Color Border = ColorTranslator.FromHtml("#2A2A2A");
-    public static readonly Color Text = ColorTranslator.FromHtml("#FFFFFF");      // TEXT_COLOR
-    public static readonly Color Muted = ColorTranslator.FromHtml("#B0B0B0");     // SUBTITLE_COLOR
-    public static readonly Color Accent = ColorTranslator.FromHtml("#FF4D4D");    // BRAND_COLOR / VALUE_COLOR
-    public static readonly Color AccentDim = ColorTranslator.FromHtml("#5D1A1A");
-    public static readonly Color Hairline = ColorTranslator.FromHtml("#C53F3F");  // HAIRLINE_COLOR
-    public static readonly Color Warn = ColorTranslator.FromHtml("#FF8080");      // BRAND_HOVER_COLOR
-    public static readonly Color Danger = ColorTranslator.FromHtml("#FF4D4D");
-    public static readonly Color Ok = ColorTranslator.FromHtml("#B0B0B0");
+    public static Color TitleBar => Header;
+    public static Color Highlight => Tone("#171717", "#EDF2F7");
+    public static Color Border => Tone("#2A2A2A", "#CBD5E1");
+    public static Color Text => Tone("#FFFFFF", "#0F172A");
+    public static Color Muted => Tone("#B0B0B0", "#475569");
+    public static Color Accent => Tone("#FF4D4D", "#B91C1C");
+    public static Color AccentDim => Tone("#5D1A1A", "#7F1D1D");
+    public static Color Hairline => Tone("#C53F3F", "#991B1B");
+    public static Color Warn => Tone("#FF8080", "#9F1239");
+    public static Color Danger => Accent;
+    public static Color Ok => Muted;
+
+    private static Color[] Palette() => new[] { Bg, Panel, PanelAlt, Header, Highlight, Border, Text, Muted, Accent, AccentDim, Hairline, Warn };
+    public static void Toggle(params Form[] windows)
+    {
+        var previous = Palette();
+        IsDark = !IsDark;
+        var current = Palette();
+        Color Map(Color color)
+        {
+            int index = Array.FindIndex(previous, p => p.ToArgb() == color.ToArgb());
+            return index < 0 ? color : current[index];
+        }
+        void Repaint(Control control)
+        {
+            bool primary = control is Button && control.BackColor.ToArgb() == previous[8].ToArgb();
+            control.BackColor = Map(control.BackColor);
+            control.ForeColor = primary && control.Enabled ? Color.White : Map(control.ForeColor);
+            if (control is Button button)
+            {
+                button.FlatAppearance.BorderColor = Map(button.FlatAppearance.BorderColor);
+                button.FlatAppearance.MouseOverBackColor = Map(button.FlatAppearance.MouseOverBackColor);
+                button.FlatAppearance.MouseDownBackColor = Map(button.FlatAppearance.MouseDownBackColor);
+            }
+            if (control is LinkLabel link)
+            { link.LinkColor = Accent; link.VisitedLinkColor = Accent; link.ActiveLinkColor = Warn; }
+            foreach (Control child in control.Controls) Repaint(child);
+            control.Invalidate();
+        }
+        foreach (var window in windows.Concat(Application.OpenForms.Cast<Form>()).Distinct().ToArray())
+        {
+            if (window.IsDisposed) continue;
+            window.SuspendLayout();
+            Repaint(window);
+            if (window.IsHandleCreated) SetTitleTheme(window);
+            window.ResumeLayout(true);
+        }
+        Directory.CreateDirectory(Path.GetDirectoryName(PreferencePath)!);
+        File.WriteAllText(PreferencePath, IsDark ? "dark" : "light");
+    }
+
+    private static void SetTitleTheme(Form form)
+    {
+        try
+        {
+            int on = IsDark ? 1 : 0;
+            if (DwmSetWindowAttribute(form.Handle, 20, ref on, sizeof(int)) != 0)
+                DwmSetWindowAttribute(form.Handle, 19, ref on, sizeof(int));
+        }
+        catch { }
+    }
 
     // Roch Viewer is monospace throughout (Consolas). It uses size 12 for body text; 10 here
     // keeps the same character while letting every row stay on screen without scrolling.
@@ -150,7 +204,7 @@ public static class Theme
         {
             try
             {
-                int on = 1;
+                int on = IsDark ? 1 : 0;
                 if (DwmSetWindowAttribute(f.Handle, 20, ref on, sizeof(int)) != 0) DwmSetWindowAttribute(f.Handle, 19, ref on, sizeof(int));
             }
             catch { }

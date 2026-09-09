@@ -19,26 +19,19 @@ public sealed class CurveOptimizerForm : Form
     {
         _hw = hw;
         _cpu = hw.Amd ?? throw new InvalidOperationException("Curve Optimizer needs an AMD CPU.");
-        int range = _cpu.Smu.Messages.CoRange;
         Text = "Curve Optimizer";
         Icon = Theme.LoadAppIcon();
         Theme.ApplyDark(this);
         FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false; ShowInTaskbar = false;
         StartPosition = FormStartPosition.CenterParent;
         int cols = _cpu.Cores.Count > 8 ? 2 : 1;
-        ClientSize = new Size(cols == 2 ? 620 : 400, 150 + 30 * (int)Math.Ceiling(_cpu.Cores.Count / (double)cols));
+        ClientSize = new Size(cols == 2 ? 620 : 440, 100 + 30 * (int)Math.Ceiling(_cpu.Cores.Count / (double)cols));
 
         var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = cols, BackColor = Theme.Bg, Padding = new Padding(14) };
         for (int c = 0; c < cols; c++) root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f / cols));
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-
-        var intro = Theme.Muted_($"Offset per core in counts, {-range} to +{range}. Negative lowers the voltage the core asks for at every frequency. " +
-                                 (_cpu.Smu.Messages.HasCurveOptimizerReadback ? "Values are read back from the SMU." : "This SMU cannot report the current values; the fields show what was last applied here."));
-        intro.MaximumSize = new Size(ClientSize.Width - 28, 0);
-        root.Controls.Add(intro, 0, 0); root.SetColumnSpan(intro, cols);
 
         var perCol = (int)Math.Ceiling(_cpu.Cores.Count / (double)cols);
         for (int c = 0; c < cols; c++)
@@ -56,23 +49,20 @@ public sealed class CurveOptimizerForm : Form
                 t.Controls.Add(name, 0, r); t.Controls.Add(loc, 1, r); t.Controls.Add(frame, 2, r);
                 _rows.Add((core, box, loc));
             }
-            root.Controls.Add(t, c, 1);
+            root.Controls.Add(t, c, 0);
         }
 
         _status.Margin = new Padding(0, 6, 0, 6);
-        root.Controls.Add(_status, 0, 2); root.SetColumnSpan(_status, cols);
+        root.Controls.Add(_status, 0, 1); root.SetColumnSpan(_status, cols);
 
         var buttons = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.RightToLeft, Dock = DockStyle.Fill, BackColor = Color.Transparent };
         var apply = Theme.Button("Apply", primary: true); apply.Width = 90; apply.AutoSize = false; apply.Height = 30;
-        var close = Theme.Button("Close"); close.Width = 80; close.AutoSize = false; close.Height = 30;
         var refresh = Theme.Button("Refresh"); refresh.Width = 80; refresh.AutoSize = false; refresh.Height = 30;
-        var sync = Theme.Button("Same for all"); sync.Height = 30; sync.AutoSize = false; sync.Width = 100;
+        foreach (var button in new[] { apply, refresh }) button.Padding = Padding.Empty;
         apply.Click += (_, _) => Apply();
-        close.Click += (_, _) => Close();
         refresh.Click += (_, _) => Fill();
-        sync.Click += (_, _) => { foreach (var (_, b, _) in _rows.Skip(1)) b.Text = _rows[0].box.Text; };
-        buttons.Controls.Add(close); buttons.Controls.Add(apply); buttons.Controls.Add(refresh); buttons.Controls.Add(sync);
-        root.Controls.Add(buttons, 0, 3); root.SetColumnSpan(buttons, cols);
+        buttons.Controls.Add(apply); buttons.Controls.Add(refresh);
+        root.Controls.Add(buttons, 0, 2); root.SetColumnSpan(buttons, cols);
         Controls.Add(root);
 
         Load += (_, _) => Fill();
