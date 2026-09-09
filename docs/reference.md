@@ -134,7 +134,7 @@ change. `--bclk-test` prints all three side by side.
 ## Requirements
 
 * Windows 10/11 x64, run **as administrator** (the manifest asks for elevation).
-* [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0), or build
+* [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0) for current source, or build
   self-contained.
 * `WinRing0x64.sys` beside the executable; the build copies it.
   * Windows **Memory Integrity** or the vulnerable-driver blocklist may refuse to load it. The

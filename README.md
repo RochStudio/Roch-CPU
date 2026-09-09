@@ -8,7 +8,7 @@ A Windows CPU and DDR5 memory tuning tool for supported Intel LGA1700 and AMD Ry
 
 1. Download the package from [Releases](https://github.com/RochStudio/Roch-CPU/releases).
 2. Extract the entire folder—keep the bundled driver and support files beside `Roch CPU.exe`.
-3. Run `Roch CPU.exe` as administrator. Framework-dependent builds need the **.NET 8 Desktop Runtime (x64)**; self-contained builds do not.
+3. Run `Roch CPU.exe` as administrator. Current-source framework-dependent builds need the **.NET 10 Desktop Runtime (x64)**; self-contained builds do not. Older releases targeting .NET 8 still need the .NET 8 runtime.
 
 Windows 10/11 x64 is required. If Windows blocks a driver, some controls will be unavailable.
 
@@ -35,7 +35,7 @@ Intel and AMD examples from earlier builds. Version 1.0.2 uses the updated group
 
 ## Build the latest source
 
-Install the **.NET 8 SDK**, then run:
+Install the **.NET 10 SDK**, then run:
 
 ```bat
 build.cmd --self-contained
@@ -54,5 +54,7 @@ Open `dist\Roch CPU.exe`. The current source version is **1.0.2**; it has not be
 - **[ryzen_smu](https://gitlab.com/leogx9r/ryzen_smu):** AMD SMN access reference. MSI Dragon Power was used for hardware behavior comparison; its code is not included.
 
 Created by **Roch Studio / [@MateoPCTech](https://x.com/MateoPCTech)**. See [third-party notices](THIRD-PARTY-NOTICES.md) for attribution, component licenses and implementation details.
+
+Join the [Roch Studio Discord](https://discord.com/invite/hPze8rTxqJ) for discussion and feedback.
 
 [Hardware details](docs/reference.md) · [BCLK investigation](docs/b850mpower-bclk-investigation.md) · [License](LICENSE)

@@ -9,6 +9,7 @@ public sealed class LogForm : Form
         BackColor = Theme.Panel, ForeColor = Theme.Text, Font = Theme.Mono, BorderStyle = BorderStyle.None
     };
 
+    [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
     public bool AllowClose { get; set; }
 
     public LogForm()
