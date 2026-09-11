@@ -191,14 +191,17 @@ public sealed class MainForm : Form
         // affordance - there is no button edge, so it lifts a shade under the pointer.
         var author = new LinkLabel
         {
-            Text = Theme.Author, LinkColor = Theme.Accent, ActiveLinkColor = Theme.Warn, VisitedLinkColor = Theme.Accent,
+            Text = "YouTube | X | Discord", ForeColor = Theme.Text, LinkColor = Theme.Accent, ActiveLinkColor = Theme.Warn, VisitedLinkColor = Theme.Accent,
             LinkBehavior = LinkBehavior.NeverUnderline, Font = Theme.Bold, AutoSize = true,
             BackColor = Color.Transparent, Cursor = Cursors.Hand, Margin = new Padding(0, 5, 0, 0)
         };
-        author.LinkClicked += (_, _) => { try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(Theme.AuthorUrl) { UseShellExecute = true }); } catch { } };
+        author.Links.Clear();
+        author.Links.Add(0, 7, "https://www.youtube.com/@MateoPcTech");
+        author.Links.Add(10, 1, Theme.AuthorUrl);
+        author.Links.Add(14, 7, "https://discord.gg/KfzExpKQHB");
+        author.LinkClicked += (_, e) => { try { if (e.Link?.LinkData is string url) System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(url) { UseShellExecute = true }); } catch { } };
         author.MouseEnter += (_, _) => author.LinkColor = Theme.Warn;
         author.MouseLeave += (_, _) => author.LinkColor = Theme.Accent;
-        new ToolTip().SetToolTip(author, Theme.AuthorUrl);
         status.Controls.Add(author, 0, 1);
         status.SetColumnSpan(_lblStatus, 2);
         status.SetColumnSpan(author, 2);
