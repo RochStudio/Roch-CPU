@@ -9,7 +9,7 @@ CPU and memory tuning for **Intel LGA1700** (12th/13th/14th Gen on any 600/700-s
 Studio tool, next to [Roch GPU](https://github.com/RochStudio/Roch-GPU) and
 [Roch Viewer](https://github.com/RochStudio/Roch-Viewer).
 
-It began as a re-creation of MSI Dragon Power that does not need an MSI board. Almost everything
+It began as a re-creation of the reference tuning tool that does not need an MSI board. Almost everything
 it does goes through interfaces every LGA1700 CPU and every Intel 600/700-series chipset expose
 the same way, so it does not care who made the board.
 

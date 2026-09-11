@@ -66,14 +66,14 @@ them, and they do not track a written limit.
 The SMN index/data access and the Global\Access_PCI mutex convention follow the
 [ryzen_smu](https://gitlab.com/leogx9r/ryzen_smu) Linux driver and LibreHardwareMonitor.
 
-## MSI Dragon Power
+## the reference tuning tool
 
-Roch CPU is not derived from MSI Dragon Power and contains none of its code. It was written to
+Roch CPU is not derived from the reference tuning tool and contains none of its code. It was written to
 provide comparable functionality on boards other than MSI's, using interfaces documented by
 Intel (model-specific registers, the overclocking mailbox) and by JEDEC (the DDR5 SPD hub and
 PMIC over SMBus).
 
-Dragon Power was used as a reference implementation for behaviour comparison on one MSI board,
+the reference tuning tool was used as a reference implementation for behaviour comparison on one MSI board,
 which is how the DDR5 PMIC voltage scales and the OC mailbox domain numbering were validated.
 
 The base-clock path in `Hardware/EcClockGen.cs` and the CPU VDD2 path in `Hardware/Vdd2Rail.cs`
