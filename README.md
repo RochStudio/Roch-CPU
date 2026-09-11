@@ -42,7 +42,7 @@ Install the **.NET 10 SDK**, then run:
 build.cmd --self-contained
 ```
 
-Open `dist\Roch CPU.exe`. The current source version is **1.0.2**; it has not been released yet.
+Open `dist\Roch CPU.exe`. The current version is **1.0.2**.
 
 > Overclocking can cause crashes, data loss or hardware damage. Change one setting at a time and test stability. Read-back checks do not prove a setting is stable.
 
