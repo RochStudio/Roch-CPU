@@ -18,10 +18,12 @@ Windows 10/11 x64 is required. If Windows blocks a driver, some controls will be
 - **AMD Ryzen tuning:** PPT, TDC, EDC, thermal limit, PBO scalar and supported FMax controls through the SMU.
 - **Per-core Curve Optimizer:** edit individual AMD core offsets, refresh hardware readings and apply changes from a dedicated window.
 - **DDR5 memory voltages:** per-DIMM VDD, VDDQ and VPP controls where the PMIC permits writes, with calibration and read-back checks.
-- **Board-specific controls:** base clock and CPU VDD2 on supported MSI Intel 600/700-series boards. AMD BCLK writing is not enabled on the tested B850MPOWER.
+- **Board-specific controls:** CPU Core override, base clock and CPU VDD2 on supported MSI Intel 600/700-series boards. Core override updates both the Renesas regulator and Intel OC mailbox, with read-back and rail verification. AMD BCLK writing is not enabled on the tested B850MPOWER.
 - **Light and dark modes:** grouped clock, power, boost and memory sections, editable values and a log explaining rejected or unavailable settings.
 - **Social links:** YouTube | X | Discord in the bottom-left footer, matching Roch Viewer.
-- **Apply, Revert and Reset:** Apply writes your edits; Revert reloads hardware readings; Reset restores the tool's startup baseline where supported.
+- **Hardware-read header:** CPU, core/thread topology, microcode, motherboard and BIOS values are labeled consistently above the controls.
+- **Intel voltage read-back:** programmed Core, E-core L2, Ring, SA and GT targets are shown when firmware supplies them. On supported MSI boards, Core displays the regulator target rather than a potentially stale mailbox-only value; an adaptive Ring with no encoded target displays the real shared IA/core-rail voltage instead of `Auto`.
+- **Apply and Reset:** Apply writes your edits; Reset restores the tool's startup baseline where supported.
 
 Controls vary by processor, motherboard, BIOS and driver access. Optional [PawnIO](https://pawnio.eu) enables AMD SMU power-table read-back for PPT/TDC/EDC; Roch CPU does not install it automatically. See the [hardware reference](docs/reference.md) for platform details.
 
@@ -42,7 +44,7 @@ Install the **.NET 10 SDK**, then run:
 build.cmd --self-contained
 ```
 
-Open `dist\Roch CPU.exe`. The current version is **1.0.2**.
+Open `dist\Roch CPU.exe`. The current version is **1.0.3**.
 
 > Overclocking can cause crashes, data loss or hardware damage. Change one setting at a time and test stability. Read-back checks do not prove a setting is stable.
 

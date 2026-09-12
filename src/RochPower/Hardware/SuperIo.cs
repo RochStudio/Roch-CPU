@@ -66,7 +66,13 @@ public sealed class SuperIo : IDisposable
         NamedRails = kind == SuperIoKind.NuvotonEc
             ? new[] { ("CPU VDD2 Voltage", RailVdd2), ("CPU AUX Voltage", RailAux) }
             : Array.Empty<(string, int)>();
-        try { _isaMutex = new Mutex(false, "Global\\Access_ISABUS.HTP.Method"); } catch { _isaMutex = null; }
+        // MSI's Nuvoton EC path uses this lock in the vendor tool. The other indexed Super-I/O
+        // families use the ISA-bus lock. Matching it prevents two tools from interleaving the
+        // page/index/data sequence on the same three ports.
+        string mutexName = kind == SuperIoKind.NuvotonEc
+            ? @"Global\Access_EC"
+            : @"Global\Access_ISABUS.HTP.Method";
+        try { _isaMutex = new Mutex(false, mutexName); } catch { _isaMutex = null; }
     }
 
     // ---------------------------------------------------------------- detection

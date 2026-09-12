@@ -12,6 +12,7 @@ public sealed record LogicalCpu(int Index, uint ApicId, int CoreId, bool IsPCore
 public sealed class IntelCpu
 {
     public const uint MSR_PLATFORM_INFO = 0xCE;
+    public const uint MSR_IA32_BIOS_SIGN_ID = 0x8B;
     public const uint MSR_FLEX_RATIO = 0x194;
     public const uint MSR_IA32_PERF_STATUS = 0x198;
     public const uint MSR_IA32_PERF_CTL = 0x199;
@@ -49,6 +50,7 @@ public sealed class IntelCpu
     public bool RatioLimitsProgrammable { get; }
     public bool TdpProgrammable { get; }
     public int TjMax { get; }
+    public uint MicrocodeRevision { get; }
 
     public IntelCpu(IKernelDriver driver)
     {
@@ -79,6 +81,17 @@ public sealed class IntelCpu
         ECoreCount = LogicalCpus.Where(c => !c.IsPCore).Select(c => c.CoreId).Distinct().Count();
         FirstPThread = LogicalCpus.FirstOrDefault(c => c.IsPCore)?.Index ?? 0;
         FirstEThread = LogicalCpus.FirstOrDefault(c => !c.IsPCore)?.Index ?? -1;
+
+        // Intel documents the loaded microcode revision in the high dword of
+        // IA32_BIOS_SIGN_ID after CPUID leaf 1 has serialised the update signature.
+        MicrocodeRevision = WinRing0Driver.RunOnCpu(FirstPThread, () =>
+        {
+            _drv.WriteMsr(MSR_IA32_BIOS_SIGN_ID, 0, FirstPThread);
+            _ = X86Base.CpuId(1, 0);
+            return _drv.ReadMsr(MSR_IA32_BIOS_SIGN_ID, out ulong signature, FirstPThread)
+                ? (uint)(signature >> 32)
+                : 0;
+        });
 
         Mailbox = new OcMailbox(_drv, FirstPThread);
 

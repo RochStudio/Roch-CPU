@@ -7,15 +7,16 @@ namespace RochPower.UI;
 public sealed class MainForm : Form
 {
     public const string AppName = "Roch CPU";
-    public const string AppVersion = "1.0.2";
+    public const string AppVersion = "1.0.3";
     private const int ResizeBorder = 6;
 
     private readonly HardwareModel _hw = new();
     private readonly LogForm _logForm = new();
 
-    // header: CPU, board, BIOS only
+    // Hardware-read identity shown above the tuning controls.
     private readonly Label _lblCpu = Theme.Label("", Theme.Big);
     private readonly Label _lblCores = Theme.Muted_("");
+    private readonly Label _lblMicrocode = Theme.Muted_("");
     private readonly Label _lblBoard = Theme.Muted_("");
     private readonly Label _lblBios = Theme.Muted_("");
     private readonly Label _lblWarn = Theme.Label("", Theme.Small, Theme.Warn);
@@ -34,7 +35,6 @@ public sealed class MainForm : Form
     private readonly Dictionary<Setting, Label> _rangeLabels = new();
 
     private readonly Button _btnApply = Theme.Button("Apply", primary: true);
-    private readonly Button _btnRevert = Theme.Button("Revert");
     private readonly Button _btnReset = Theme.Button("Reset");
     private readonly Label _lblStatus = Theme.Label("", Theme.Small, Theme.Muted);
 
@@ -106,7 +106,7 @@ public sealed class MainForm : Form
         _body.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // status
         outer.Controls.Add(_body, 0, 1);
 
-        // header: CPU name + cores/threads, board, BIOS. Log button top right.
+        // Header: CPU, topology, microcode, board and BIOS. Log button top right.
         var header = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 2, BackColor = Theme.Bg, Margin = new Padding(0, 0, 0, 2) };
         header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -127,13 +127,15 @@ public sealed class MainForm : Form
         header.Controls.Add(headerButtons, 1, 0);
         header.SetRowSpan(headerButtons, 2);
         _lblCores.Margin = new Padding(0, 2, 0, 0);
+        _lblMicrocode.Margin = new Padding(0, 2, 0, 0);
         _lblBoard.Margin = new Padding(0, 2, 0, 0);
         _lblBios.Margin = new Padding(0, 2, 0, 0);
         _lblWarn.Margin = new Padding(0, 4, 0, 0);
         header.Controls.Add(_lblCores, 0, 1);
-        header.Controls.Add(_lblBoard, 0, 2);
-        header.Controls.Add(_lblBios, 0, 3);
-        header.Controls.Add(_lblWarn, 0, 4);
+        header.Controls.Add(_lblMicrocode, 0, 2);
+        header.Controls.Add(_lblBoard, 0, 3);
+        header.Controls.Add(_lblBios, 0, 4);
+        header.Controls.Add(_lblWarn, 0, 5);
         header.SetColumnSpan(_lblWarn, 2);
         _body.Controls.Add(header, 0, 0);
 
@@ -163,22 +165,18 @@ public sealed class MainForm : Form
         _rows.Margin = new Padding(0, 6, 0, 0);
         _body.Controls.Add(_rows, 0, 2);
 
-        // apply / revert / reset
-        var applyRow = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 3, BackColor = Theme.Bg, Margin = new Padding(0, 8, 0, 0) };
-        applyRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 34));
-        applyRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33));
-        applyRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33));
+        // Apply / reset. Refresh-from-hardware remains automatic for live read-only rows.
+        var applyRow = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 2, BackColor = Theme.Bg, Margin = new Padding(0, 8, 0, 0) };
+        applyRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+        applyRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
         _btnApply.Dock = DockStyle.Fill; _btnApply.AutoSize = false; _btnApply.Height = 32; _btnApply.Margin = new Padding(0, 0, 6, 0);
-        _btnRevert.Height = 32; _btnRevert.AutoSize = false; _btnRevert.Width = 80; _btnRevert.Padding = new Padding(0); _btnRevert.Margin = new Padding(0, 0, 6, 0);
         _btnReset.Height = 32; _btnReset.AutoSize = false; _btnReset.Width = 72; _btnReset.Padding = new Padding(0); _btnReset.Margin = new Padding(0);
-        _btnRevert.Dock = DockStyle.Fill; _btnReset.Dock = DockStyle.Fill;
-        _btnApply.Height = _btnRevert.Height = _btnReset.Height = 38;
+        _btnReset.Dock = DockStyle.Fill;
+        _btnApply.Height = _btnReset.Height = 38;
         _btnApply.Click += (_, _) => ApplyAll();
-        _btnRevert.Click += (_, _) => RefreshRows("Reverted the fields to what the hardware reports.");
         _btnReset.Click += (_, _) => RestoreDefaults();
         applyRow.Controls.Add(_btnApply, 0, 0);
-        applyRow.Controls.Add(_btnRevert, 1, 0);
-        applyRow.Controls.Add(_btnReset, 2, 0);
+        applyRow.Controls.Add(_btnReset, 1, 0);
         _body.Controls.Add(applyRow, 0, 3);
 
         // status
@@ -211,7 +209,7 @@ public sealed class MainForm : Form
         {
             int w = Math.Max(240, ClientSize.Width - 90);
             _lblStatus.MaximumSize = new Size(w, 0);
-            foreach (var l in new[] { _lblCpu, _lblCores, _lblBoard, _lblBios, _lblWarn }) l.MaximumSize = new Size(ClientSize.Width - 80, 0);
+            foreach (var l in new[] { _lblCpu, _lblCores, _lblMicrocode, _lblBoard, _lblBios, _lblWarn }) l.MaximumSize = new Size(ClientSize.Width - 80, 0);
         };
     }
 
@@ -344,16 +342,20 @@ public sealed class MainForm : Form
             // Vendor-neutral summary from the model (Intel and AMD both feed it). The generation
             // string is deliberately not shown: it is still detected and still drives the
             // platform warning, it just does not earn a line in the header.
-            _lblCpu.Text = _hw.CpuName;
-            _lblCores.Text = _hw.CoreSummary;
+            _lblCpu.Text = $"CPU: {_hw.CpuName}";
+            _lblCores.Text = $"Cores / Threads: {_hw.CoreSummary}";
+            _lblMicrocode.Text = _hw.MicrocodeRevision > 0
+                ? $"Microcode: 0x{_hw.MicrocodeRevision:X}"
+                : "Microcode: Unknown";
         }
         else
         {
-            _lblCpu.Text = "No CPU access";
-            _lblCores.Text = _hw.DriverStatus;
+            _lblCpu.Text = "CPU: No CPU access";
+            _lblCores.Text = $"Driver: {_hw.DriverStatus}";
+            _lblMicrocode.Text = "Microcode: Unknown";
         }
-        _lblBoard.Text = string.IsNullOrWhiteSpace(sm.BoardProduct) ? sm.SystemProduct : sm.BoardProduct;
-        _lblBios.Text = $"BIOS {sm.BiosVersion}";
+        _lblBoard.Text = $"Motherboard: {(string.IsNullOrWhiteSpace(sm.BoardProduct) ? sm.SystemProduct : sm.BoardProduct)}";
+        _lblBios.Text = $"BIOS: {sm.BiosVersion}";
 
         var warns = new List<string>();
         if (_hw.Driver == null) warns.Add("kernel driver not loaded, nothing can be read or written (see Log)");
@@ -363,7 +365,6 @@ public sealed class MainForm : Form
         if (_hw.Amd is { IsSupported: false }) warns.Add("unknown Zen generation: SMU message numbers assumed");
         if (_hw.Amd != null && !_hw.SmuAvailable) warns.Add("SMU not responding: PBO rows disabled (see Log)");
         if (_hw.Amd != null && _hw.SmuAvailable && !_hw.PboAllowed) warns.Add("SMU reports PBO unavailable: enable Precision Boost Overdrive in the BIOS or writes will be rejected");
-        if (_hw.BiosCoreOverride) warns.Add("BIOS core voltage is in Override mode: on boards that pin the VRM there, CPU Core Voltage changes only the VID. Use Adaptive/Auto in BIOS.");
         _lblWarn.Text = string.Join("  ·  ", warns);
         _lblWarn.Visible = warns.Count > 0;
 
@@ -551,7 +552,7 @@ public sealed class MainForm : Form
 
     private void SetControlsEnabled(bool on)
     {
-        _btnApply.Enabled = on; _btnRevert.Enabled = on; _btnReset.Enabled = on;
+        _btnApply.Enabled = on; _btnReset.Enabled = on;
         _btnApply.Text = on ? "Apply" : "Working...";
     }
 

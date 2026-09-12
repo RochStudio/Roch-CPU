@@ -44,7 +44,8 @@ voltages and board rails on one, the SMU's limits and Curve Optimizer on the oth
 | CPU ratio (all-core and the per-active-core-count table) | MSR 0x1AD / 0x1AE | unlocked multiplier (Z-series + K CPU). Elsewhere *OC Lock* rejects the write and the window says so |
 | E-core ratio | MSR 0x650 | same |
 | Ring ratio | OC mailbox + MSR 0x620 (the MSR alone is ignored on Alder/Raptor Lake) | same |
-| Core / E-core L2 / Ring / SA / GT voltage, offset or override | Intel OC mailbox (MSR 0x150) over the CPU's SVID path | every board, **if the VRM follows SVID** — see below. On Raptor Lake SA is domain 4 and E-core L2 domain 5, both measured; published tables often say 3 |
+| CPU Core voltage override | Renesas regulator over the MSI EC I²C mailbox, then Intel OC mailbox domain 0 | tested Z790MPOWER and supported MSI 600/700-series boards with a Nuvoton EC; both targets are read back and Vcore is measured |
+| E-core L2 / Ring / SA / GT voltage, offset or override | Intel OC mailbox (MSR 0x150) over the CPU's SVID path | every board, **if the VRM follows SVID**. On Raptor Lake SA is domain 4 and E-core L2 domain 5; published tables often say 3 |
 | PL1 / PL2 power limits | MSR 0x610 | every board unless locked in BIOS |
 | Base clock | the board's clock generator, over the EC's I²C mailbox | MSI 600/700-series with a Nuvoton EC. Read-only elsewhere |
 | CPU VDD2 | the board's regulator, over the same mailbox | same boards; clamped to 1.100–1.450 V |
@@ -88,20 +89,17 @@ start as *Auto* and show what you last wrote. Roch CPU never installs PawnIO its
 
 ## If a voltage change does nothing
 
-A CPU voltage can be set from either end of the SVID link: ask the CPU to request a different
-voltage (the OC mailbox — portable, what Roch CPU does), or tell the VRM what to output (always
-works, but needs that board's specific controller, bus, address and encoding).
+A CPU voltage can be set through the Intel OC mailbox or through a board-specific VRM interface.
+On the tested Z790MPOWER, the mailbox alone is not enough: it accepts and reads back a new target
+without moving the physical rail. MSI Dragon Power first selects page 0 of the Renesas regulator at
+EC-I²C address `0xC6`, writes the millivolt target to register `0x21`, selects override mode in
+register `0xF0`, and only then writes Intel OC mailbox domain 0. Roch CPU follows that same order.
 
-With the BIOS **CPU Core Voltage Mode** on `Override`, MSI boards pin the VRM output and the CPU's
-request goes nowhere — so a vendor tool writing the VRM still works and any CPU-side tool does
-nothing. **The fix:** set the mode to `Adaptive` with **CPU Core Voltage** on `Auto`, then reboot;
-the mode only takes effect on the next boot. An explicit value left in that field pins the VRM the
-same way even when the mode says Adaptive.
-
-Roch CPU does not pretend otherwise. Applying a core voltage compares the VID the CPU now requests
-against the rail the Super I/O measures: if the request moved and the rail did not, the row is
-marked **board ignored it**, the apply counts as failed, and the log says why. It also warns in the
-header when it finds the BIOS in Override mode. `--vcore-test` settles it in one command.
+The CPU Core row reads the regulator target, writes both stages, reads both back, and rolls the
+regulator back if the CPU mailbox rejects the second stage. It then compares the requested target
+with the rail measured by the Super I/O. A controlled 1.290 → 1.310 → 1.290 V test moved measured
+Vcore +28 mV and -23 mV respectively, confirming the board path. `--vcore-test` provides the same
+kind of measured check on another configuration.
 
 ## Base clock and CPU VDD2
 
@@ -162,7 +160,7 @@ Or `dotnet publish src/RochPower -c Release -o dist`.
   window and reopen it, that becomes the new starting point. Reboot to get back to BIOS values. A
   voltage override goes back to *Auto*. On AMD, PPT / TDC / EDC cannot be read at start-up, so 0
   writes the CPU's stock limit.
-* **Revert** re-reads the hardware into the fields; **Reset** writes the start-up values back.
+* Read-only rows refresh automatically; **Reset** writes the start-up values back.
 * **Per-Core Ratio Table** (Intel) and **Curve Optimizer** (AMD) open the per-core dialogs.
 * **Auto ratio step** (Intel) raises the ratio every *n* seconds until a write is rejected or you
   press Stop. Run a stress test beside it.

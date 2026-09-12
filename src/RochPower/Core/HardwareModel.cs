@@ -41,6 +41,9 @@ public sealed class HardwareModel : IDisposable
     public BclkController? BclkControl { get; private set; }
     /// <summary>CPU VDD2 control, when the board's regulator is reachable. Null otherwise.</summary>
     public Vdd2Rail? Vdd2 { get; private set; }
+    /// <summary>MSI board-side CPU-core regulator control. The Intel mailbox alone is insufficient on these boards.</summary>
+    public MsiCoreVoltage? CoreVoltage { get; private set; }
+    public string CoreVoltageStatus { get; private set; } = "not probed";
     public List<Ddr5Dimm> Dimms { get; } = new();
     public List<Setting> Settings { get; } = new();
 
@@ -71,13 +74,14 @@ public sealed class HardwareModel : IDisposable
         get
         {
             if (Cpu is { } c)
-                return c.ECoreCount > 0 ? $"{c.PCoreCount}P + {c.ECoreCount}E cores, {c.LogicalCpus.Count} threads" : $"{c.PCoreCount} cores, {c.LogicalCpus.Count} threads";
+                return c.ECoreCount > 0 ? $"{c.PCoreCount}P + {c.ECoreCount}E / {c.LogicalCpus.Count}" : $"{c.PCoreCount} / {c.LogicalCpus.Count}";
             if (Amd is { } a)
-                return $"{a.CoreCount} cores, {a.LogicalCount} threads" + (a.CcdCount > 1 ? $", {a.CcdCount} CCDs" : "");
+                return $"{a.CoreCount} / {a.LogicalCount}";
             return "";
         }
     }
     public int BaseRatio => Cpu?.BaseRatio ?? Amd?.BaseRatio ?? 0;
+    public uint MicrocodeRevision => Cpu?.MicrocodeRevision ?? Amd?.PatchLevel ?? 0;
 
     private double _lastEnergyJ; private DateTime _lastEnergyAt;
 
@@ -156,6 +160,14 @@ public sealed class HardwareModel : IDisposable
                     if (EcMailbox.IsSupported(SuperIo))
                     {
                         var mailbox = new EcMailbox(SuperIo);
+                        bool msiBoard = Smbios.BoardManufacturer.Contains("Micro-Star", StringComparison.OrdinalIgnoreCase)
+                                     || Smbios.SystemManufacturer.Contains("Micro-Star", StringComparison.OrdinalIgnoreCase);
+                        if (Cpu != null && msiBoard)
+                        {
+                            CoreVoltage = MsiCoreVoltage.TryCreate(mailbox, out string coreVoltageStatus);
+                            CoreVoltageStatus = coreVoltageStatus;
+                            Emit("CPU core regulator: " + coreVoltageStatus);
+                        }
                         if (Cpu is { } bclkCpu && Bclk is { IsAvailable: true } bclkMeter)
                         {
                             var control = new BclkController(new EcClockGen(mailbox),
@@ -194,10 +206,8 @@ public sealed class HardwareModel : IDisposable
                     var core = Cpu.Mailbox.ReadDomain(OcMailbox.DOMAIN_CORE);
                     BiosCoreOverride = core.OverrideMode;
                     if (BiosCoreOverride)
-                        Emit($"BIOS has the core voltage in Override mode ({core.TargetVolts:0.000} V fixed VID). MSI boards also pin the VRM output in this mode, so " +
-                             "CPU Core Voltage here moves only the VID the CPU requests and the real Vcore stays where the BIOS put it. " +
-                             "Set the BIOS CPU Core Voltage Mode to Adaptive or Auto to control Vcore from here. " +
-                             "Watch the Vcore tile against VID to confirm which is happening.");
+                        Emit($"BIOS has the core voltage in Override mode ({core.TargetVolts:0.000} V). " +
+                             "The board regulator path will also be probed before CPU Core Voltage is made writable; the measured Vcore rail is checked after each change.");
                 }
                 catch { }
             }
@@ -286,21 +296,96 @@ public sealed class HardwareModel : IDisposable
         // ---------------- FIVR voltages via OC mailbox ----------------
         var mb = cpu?.Mailbox;
         bool mbOk = mb != null && MailboxAvailable;
+        bool msiBoard = Smbios.BoardManufacturer.Contains("Micro-Star", StringComparison.OrdinalIgnoreCase)
+                     || Smbios.SystemManufacturer.Contains("Micro-Star", StringComparison.OrdinalIgnoreCase);
+        void WriteOverride(int domain, double volts)
+        {
+            if (domain != OcMailbox.DOMAIN_CORE || CoreVoltage == null)
+            {
+                mb!.SetOverride(domain, volts);
+                return;
+            }
+
+            // MSI programs the board regulator first and the CPU request second. Keep a complete
+            // regulator snapshot so a rejected OC-mailbox write cannot leave the two disagreeing.
+            var before = CoreVoltage.ReadState();
+            var mailboxBefore = mb!.ReadDomain(domain);
+            CoreVoltage.SetOverride(volts);
+            try
+            {
+                mb.SetOverride(domain, volts);
+                var after = mb.ReadDomain(domain);
+                if (!after.OverrideMode || Math.Abs(after.TargetVolts - volts) > 0.0011)
+                    throw new IOException($"Intel mailbox did not retain {volts:0.000} V (read back {after.TargetVolts:0.000} V)");
+            }
+            catch
+            {
+                try { mb.WriteDomain(domain, mailboxBefore); } catch { }
+                try { CoreVoltage.Restore(before); } catch { }
+                throw;
+            }
+        }
+        void ClearOverride(int domain)
+        {
+            if (domain != OcMailbox.DOMAIN_CORE || CoreVoltage == null)
+            {
+                mb!.SetOverride(domain, 0);
+                return;
+            }
+
+            var before = CoreVoltage.ReadState();
+            var mailboxBefore = mb!.ReadDomain(domain);
+            CoreVoltage.DisableOverride();
+            try
+            {
+                mb.SetOverride(domain, 0);
+                if (mb.ReadDomain(domain).OverrideMode)
+                    throw new IOException("Intel mailbox remained in override mode");
+            }
+            catch
+            {
+                try { mb.WriteDomain(domain, mailboxBefore); } catch { }
+                try { CoreVoltage.Restore(before); } catch { }
+                throw;
+            }
+        }
         void AddDomain(string idPrefix, string name, int domain, double minV, double maxV, bool available)
         {
+            bool rowAvailable = available && (domain != OcMailbox.DOMAIN_CORE || !msiBoard || CoreVoltage != null);
             Settings.Add(new Setting
             {
                 Id = idPrefix + "_v", Name = name + " Voltage", Group = SettingGroup.Voltages, Unit = "V", Min = minV, Max = maxV, Decimals = 3,
                 Read = () =>
                 {
-                    if (!mbOk || !available) return null;
+                    if (!mbOk || !rowAvailable) return null;
+                    if (domain == OcMailbox.DOMAIN_CORE && CoreVoltage != null)
+                        return CoreVoltage.ReadTargetVolts();
                     var s = mb!.ReadDomain(domain);
-                    return s.OverrideMode ? s.TargetVolts : null;
+                    // MSI Dragon Power shows the programmed target even when firmware leaves the
+                    // mode bit adaptive. In particular, the E-core L2 domain reports 1.050 V in
+                    // target bits 19:8 while bit 20 is clear; hiding it as Auto loses a real value.
+                    if (s.TargetVolts > 0) return s.TargetVolts;
+
+                    // Ring and cores share the IA voltage rail on LGA1700. A stock/adaptive ring
+                    // domain encodes a zero target, which used to render as Auto even though the
+                    // shared rail has a real readable voltage. Prefer the stable MSI regulator
+                    // target, then the measured rail, then the CPU's current VID.
+                    if (domain == OcMailbox.DOMAIN_RING)
+                    {
+                        if (CoreVoltage?.ReadTargetVolts() is double target) return target;
+                        if (SuperIo?.ReadVcore() is double rail && rail is > 0.4 and < 2.5) return rail;
+                        try { return cpu?.ReadPerfStatus(cpu.FirstPThread).vid; } catch { }
+                    }
+                    return null;
                 },
-                Write = mbOk && available ? v => mb!.SetOverride(domain, v) : null,
-                RestoreDefault = mbOk && available ? () => mb!.SetOverride(domain, 0) : null,
-                Note = $"Static override voltage for domain {domain} through the OC mailbox: the VID the CPU requests from the VRM. The board's load-line adds its own offset on top (the VID readout shows the request). Auto = adaptive (default). Enter 0 to go back to Auto.",
-                Available = mbOk && available
+                Write = mbOk && rowAvailable ? v => WriteOverride(domain, v) : null,
+                RestoreDefault = mbOk && rowAvailable ? () => ClearOverride(domain) : null,
+                Note = domain == OcMailbox.DOMAIN_CORE && CoreVoltage != null
+                    ? "CPU-core override written to both the MSI board regulator and Intel OC mailbox, in the same order as MSI Dragon Power. Both targets are read back; a failure rolls the regulator back. Enter 0 to return to adaptive mode."
+                    : domain == OcMailbox.DOMAIN_RING
+                    ? "Ring override through Intel OC mailbox domain 2. While the domain is adaptive and has no encoded target, the displayed number is read from the shared IA/core voltage rail instead of showing Auto."
+                    : $"Programmed voltage target for domain {domain} through the Intel OC mailbox. Entering a value selects override mode; the board's load-line still affects the measured rail. Enter 0 to return to adaptive mode.",
+                Available = mbOk && rowAvailable
             });
             Settings.Add(new Setting
             {
@@ -661,7 +746,7 @@ public sealed class HardwareModel : IDisposable
             var vals = new List<double>(samples);
             for (int i = 0; i < samples; i++)
             {
-                if (SuperIo.ReadVcore() is double v) vals.Add(v);
+                if (SuperIo.ReadVcore() is double v && v is > 0.4 and < 2.5) vals.Add(v);
                 Thread.Sleep(30);
             }
             return vals.Count == 0 ? null : (vals.Average(), vals.Max() - vals.Min());
@@ -679,9 +764,13 @@ public sealed class HardwareModel : IDisposable
     public bool Apply(Setting s, double value)
     {
         if (s.Write == null) { Emit($"{s.Name}: read-only."); return false; }
-        bool verify = IsCoreVoltageRow(s) && SuperIo != null;
+        // A detected Super I/O does not necessarily have a valid Vcore channel. Do not claim a
+        // rail check unless an actual plausible sample was captured. The MSI regulator path also
+        // performs its own target-register readback.
+        var railBefore = IsCoreVoltageRow(s) ? SampleVcore() : null;
+        bool verify = railBefore != null;
         double? vidBefore = verify ? SampleVid() : null;
-        var railBefore = verify ? SampleVcore() : null;
+        double? settingBefore = s.Current;
         try
         {
             if (value == 0)
@@ -701,7 +790,12 @@ public sealed class HardwareModel : IDisposable
             s.Write(value);
             Refresh(s);
             Emit($"{s.Name}: set to {s.Format(value)}{(s.Unit == "" ? "" : " " + s.Unit)} (now {s.CurrentText}).");
-            if (verify) VerifyAgainstRail(s, vidBefore, railBefore);
+            if (s.Id == "core_v" && CoreVoltage != null)
+            {
+                CoreVoltageIgnored = false;
+                Emit($"{s.Name}: MSI regulator and Intel mailbox both read back {s.CurrentText} V.");
+            }
+            if (verify && VerifyAgainstRail(s, settingBefore, vidBefore, railBefore) == false) return false;
             return true;
         }
         catch (Exception ex)
@@ -712,36 +806,42 @@ public sealed class HardwareModel : IDisposable
     }
 
     /// <summary>
-    /// The CPU accepting a voltage request does not mean the board acted on it: with the BIOS core
-    /// voltage in Override mode the VRM is pinned and the request goes nowhere. Compare the VID the
-    /// CPU now asks for against the rail the Super I/O measures, and say so when they disagree.
+    /// The CPU accepting a voltage request does not prove the board acted on it. Compare the VID
+    /// the CPU now asks for against the rail the Super I/O measures, and say so when they disagree.
     /// </summary>
-    private void VerifyAgainstRail(Setting s, double? vidBefore, (double mean, double spread)? railBefore)
+    private bool? VerifyAgainstRail(Setting s, double? settingBefore, double? vidBefore, (double mean, double spread)? railBefore)
     {
         Thread.Sleep(300);
         double? vidAfter = SampleVid();
         var railAfter = SampleVcore();
-        if (vidBefore is not double v0 || vidAfter is not double v1 || railBefore is not { } r0 || railAfter is not { } r1) return;
+        if (vidBefore is not double v0 || vidAfter is not double v1 || railBefore is not { } r0 || railAfter is not { } r1) return null;
         double dVid = (v1 - v0) * 1000, dRail = (r1.mean - r0.mean) * 1000;
-        if (Math.Abs(dVid) < 15) return; // request barely moved: nothing to check
+        // For a fixed core override, compare the rail with the regulator target that was actually
+        // changed. VID can move even during a no-op reconciliation because the mailbox and board
+        // had previously been left out of sync. Offset rows still use the VID delta.
+        double expectedMv = s.Id == "core_v" && settingBefore is double oldTarget && s.Current is double newTarget
+            ? (newTarget - oldTarget) * 1000
+            : dVid;
+        if (Math.Abs(expectedMv) < 5) return true; // target did not move: register readback is the verification
 
         // A real change must be in the same direction as the request, clear of the rail's own
         // noise band, and a decent fraction of what was asked for. Magnitude alone is not enough:
         // idle Vcore wanders by tens of millivolts on its own.
         double noise = Math.Max(Math.Max(r0.spread, r1.spread) * 1000, 12);
-        bool sameDirection = Math.Sign(dRail) == Math.Sign(dVid);
-        bool followed = sameDirection && Math.Abs(dRail) > noise && Math.Abs(dRail) >= Math.Abs(dVid) * 0.35;
+        bool sameDirection = Math.Sign(dRail) == Math.Sign(expectedMv);
+        bool followed = sameDirection && Math.Abs(dRail) > noise && Math.Abs(dRail) >= Math.Abs(expectedMv) * 0.35;
 
         if (followed)
         {
-            Emit($"{s.Name}: verified at the rail - VID {dVid:+0;-0} mV, measured Vcore {dRail:+0;-0} mV (now {r1.mean:0.000} V).");
+            Emit($"{s.Name}: verified at the rail - target {expectedMv:+0;-0} mV, VID {dVid:+0;-0} mV, measured Vcore {dRail:+0;-0} mV (now {r1.mean:0.000} V).");
             CoreVoltageIgnored = false;
-            return;
+            return true;
         }
         CoreVoltageIgnored = true;
-        Emit($"{s.Name}: NOT APPLIED at the rail. The CPU now requests {dVid:+0;-0} mV but the measured Vcore moved {dRail:+0;-0} mV " +
+        Emit($"{s.Name}: NOT APPLIED at the rail. The requested target moved {expectedMv:+0;-0} mV (VID {dVid:+0;-0} mV) but measured Vcore moved {dRail:+0;-0} mV " +
              $"(still {r1.mean:0.000} V, rail noise +/-{noise:0} mV). The board is holding the VRM at a fixed voltage, so the CPU's request is ignored. " +
-             "Set CPU Core Voltage Mode to Adaptive (or Auto) in the BIOS; if it is already there, this board only accepts Vcore from its own VRM tool.");
+             "The mailbox readback changed but this board did not follow it; restore the value and use the board BIOS/vendor control for this configuration.");
+        return false;
     }
 
     /// <summary>Set when an apply was measured not to reach the rail.</summary>
@@ -830,6 +930,7 @@ public sealed class HardwareModel : IDisposable
 
     public void Dispose()
     {
+        CoreVoltage?.Dispose();
         SuperIo?.Dispose();
         Bclk?.Dispose();
         Smbus?.Dispose();
