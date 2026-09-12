@@ -34,7 +34,7 @@ Controls vary by processor, motherboard, BIOS and driver access. Optional [PawnI
   <img src="screenshot-amd.png" alt="Roch CPU AMD Ryzen tuning controls" width="360">
 </p>
 
-Left: Intel example from an earlier build. Right: Roch CPU 1.0.2 on an AMD Ryzen 7 9850X3D, showing the current grouped layout. Available rows follow the detected hardware. Displayed settings are examples, not tuning recommendations.
+Left: Roch CPU 1.0.3 on an Intel Core i5-14600KF / Z790MPOWER, including the board-backed Core override and numeric adaptive Ring voltage. Right: the latest real AMD-hardware capture, Roch CPU 1.0.2 on an AMD Ryzen 7 9850X3D. Available rows follow the detected hardware. Displayed settings are examples, not tuning recommendations.
 
 ## Build the latest source
 
