@@ -44,7 +44,78 @@ Install the **.NET 10 SDK**, then run:
 build.cmd --self-contained
 ```
 
-Open `dist\Roch CPU.exe`. The current version is **1.0.3**.
+Open `dist\Roch CPU.exe`. The current version is **1.0.4**.
+
+### Intel write verification
+
+Voltage requests are checked against the OC mailbox response. Rejected or ignored targets
+produce an error and an attempt to restore the previous mailbox value. Ratio and power
+register writes are also read back; the UI says **read back**, which verifies the stored
+request, not sustained clocks or physical voltage. Live VID is shown separately from the
+editable voltage target; VID is a CPU request, not a measured Vcore rail.
+Supported Super I/O monitors provide a separate live Vcore reading. ASUS NCT6798D
+detection uses chip ID `0xD42B` and verifies the monitor vendor ID before reading it.
+Noisy rail samples report an unverified response without asserting a firmware cause.
+
+On the validated ASUS Z790-A GAMING WIFI D4 configuration, CPU Core uses ASUS's
+Global Core SVID Manual mode through the installed ASUS control service. Complete
+mode/target/offset readback and rollback protect against a partially applied request.
+The live Vcore reading comes from ASUS hardware monitoring. A 1.300 V target produced
+about 1.341 V measured in testing; requested voltage is not a promise of exact rail voltage.
+The ASUS voltage row labels the editable value as a target and shows measured Vcore
+and its difference from the applied target immediately below. Unsaved edits are not
+used as the comparison target, and no automatic compensation is applied.
+The ASUS CPU VRM offset control has been removed. SA and CPU E-core L2 targets now
+use the dedicated ASUS board controls, with rail-specific metadata validation,
+complete state readback and rollback. Both were tested at 1.100 V and restored to
+Auto: measured SA was about 1.089 V and L2 about 1.104 V. Their own sensor readings
+are logged after applying; these are separate from Vcore.
+Ring voltage uses ASUS Cache SVID with complete state readback and rollback. A
+temporary 1.300 V request was verified in both ASUS state and the CPU cache-domain
+register, then restored to Auto; ring ratio remained 50x. Ring and cores share
+Vcore, so this is a requested target, not a separate measured ring supply.
+Board rail rows require a validated sensor mapping. MSI VDD2/AUX channel labels
+are no longer incorrectly displayed on the ASUS DDR4 board.
+The original MSI regulator path is preserved. ASUS BCLK remains read-only: the vendor
+target accepted changes in testing while the physical clock stayed unchanged.
+See [ASUS validation notes](docs/asus-z790-validation.md) for results and dependencies.
+
+When a hypervisor is detected, the app warns that register values may be virtualized.
+Windows VBS/Memory Integrity and BIOS policy can restrict tuning. The app does not disable
+security features or bypass BIOS locks. See [Intel's VBS compatibility guidance](https://www.intel.com/content/www/us/en/support/articles/000093813/processors/processor-utilities-and-programs.html).
+
+`--probe` collects readings without tuning writes. `--intel-audit` collects per-thread
+register data. `--intel-validate 1.3` is an explicit hardware test: it briefly lowers the
+P-core ceiling under a single-thread load, tests the current E-core table and a 1.300 V
+mailbox target, and restores the captured P-core and voltage settings. It refuses to run
+with another Roch CPU instance open. When a Vcore monitor is available, it also records
+settled measurements before the override, with it applied, and after restoration.
+Voltage readback alone does not establish physical Vcore.
+
+Ring control uses MSR `0x620` and additionally updates a populated ring mailbox domain.
+A completely empty domain no longer causes a verified ring-register write to be rolled
+back. This preserves the mailbox path used on MSI boards. `--ring-validate` briefly lowers
+the ring ceiling, checks the running ring ratio, and restores the original register. It
+requires one Roch CPU instance and writes `ring-validation.txt` beside the executable.
+The header displays live P-core, E-core and ring ratios separately from their limits.
+
+E-core control preserves unused zero entries in the turbo table. Boards exposing a
+single active entry update that entry; fully populated tables continue to update all
+groups. The per-core editor disables unused groups instead of programming them.
+
+When Hyper-V is active, the app checks Windows event 12550 from the current boot.
+If Windows explicitly reports restricted writes to the voltage mailbox, voltage rows
+are disabled with the recorded cause. This leaves P-core and ring control available.
+Old events from previous boots do not disable controls. `--windows-audit` exports this
+evidence without opening the kernel driver. `--ecore-validate 44` briefly tests the E-core
+target and restores its table; it requires one instance and permits at most a one-step
+increase above the current ceiling, with an absolute test maximum of 44.
+
+Regression checks use a simulated driver and never open the hardware driver:
+
+```bat
+dotnet run --project tests\RochPower.Tests -c Release
+```
 
 > Overclocking can cause crashes, data loss or hardware damage. Change one setting at a time and test stability. Read-back checks do not prove a setting is stable.
 

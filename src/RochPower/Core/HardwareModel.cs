@@ -10,6 +10,7 @@ public sealed class LiveStatus
     public int? PackageTempC { get; set; }
     public double? CoreMHz { get; set; }
     public int? CoreRatio { get; set; }
+    public int? ECoreRatio { get; set; }
     public double? CoreVid { get; set; }
     public int? RingRatio { get; set; }
     public double? BclkMHz { get; set; }
@@ -39,6 +40,7 @@ public sealed class HardwareModel : IDisposable
     public string SuperIoStatus { get; private set; } = "not probed";
     /// <summary>Base-clock control, when the board's clock generator is reachable. Null otherwise.</summary>
     public BclkController? BclkControl { get; private set; }
+    public AsusBoardControl? AsusControl { get; private set; }
     /// <summary>CPU VDD2 control, when the board's regulator is reachable. Null otherwise.</summary>
     public Vdd2Rail? Vdd2 { get; private set; }
     /// <summary>MSI board-side CPU-core regulator control. The Intel mailbox alone is insufficient on these boards.</summary>
@@ -50,6 +52,7 @@ public sealed class HardwareModel : IDisposable
     public string DriverStatus { get; private set; } = "not loaded";
     public string SmbusStatus { get; private set; } = "not probed";
     public bool MailboxAvailable { get; private set; }
+    public string? VoltageAccessRestriction { get; private set; }
     /// <summary>True when the BIOS left the core domain in mailbox Override mode (fixed VID).</summary>
     public bool BiosCoreOverride { get; private set; }
     public bool OcLocked { get; private set; }
@@ -184,6 +187,12 @@ public sealed class HardwareModel : IDisposable
             catch (Exception ex) { Emit("Super I/O error: " + ex.Message); }
         }
 
+        if (Cpu != null)
+        {
+            AsusControl = AsusBoardControl.TryCreate(Smbios.BoardManufacturer, out string asusStatus);
+            if (Smbios.BoardManufacturer.Contains("ASUS", StringComparison.OrdinalIgnoreCase))
+                Emit("ASUS control: " + asusStatus);
+        }
         BuildSettings();
         RefreshAll(captureDefaults: true);
     }
@@ -193,12 +202,21 @@ public sealed class HardwareModel : IDisposable
         try
         {
             Cpu = new IntelCpu(Driver!);
+            if (Cpu.HypervisorPresent)
+                Emit("Hypervisor detected. Register readback may be virtualized and does not prove a tuning change reached the CPU. VBS/Memory Integrity can restrict overclocking access.");
             Emit($"CPU: {Cpu.BrandString} - {Cpu.Generation}, {Cpu.PCoreCount}P + {Cpu.ECoreCount}E cores, base ratio {Cpu.BaseRatio}, TjMax {Cpu.TjMax} C");
             if (!Cpu.IsLga1700Family) Emit("Warning: this CPU is not a known LGA1700 (12th-14th Gen desktop) part. Ratio/voltage controls may not behave as expected.");
             OcLocked = Cpu.IsOcLocked;
             if (OcLocked) Emit("Warning: BIOS has set OC Lock (MSR 0x194 bit 20). Ratio and voltage changes will be rejected on this board/chipset.");
             MailboxAvailable = Cpu.Mailbox.IsAvailable;
-            if (!MailboxAvailable) Emit("OC mailbox (MSR 0x150) not responding; FIVR voltage rows disabled.");
+            if (Cpu.HypervisorPresent)
+            {
+                var restrictions = HypervisorRestrictions.ReadCurrentBoot(out string status);
+                Emit(status);
+                VoltageAccessRestriction = HypervisorRestrictions.VoltageBlockReason(restrictions);
+                if (VoltageAccessRestriction != null) MailboxAvailable = false;
+            }
+            if (!MailboxAvailable) Emit(VoltageAccessRestriction ?? "OC mailbox (MSR 0x150) not responding; FIVR voltage rows disabled.");
             else
             {
                 try
@@ -270,6 +288,7 @@ public sealed class HardwareModel : IDisposable
         Settings.Add(new Setting
         {
             Id = "cpu_ratio", Name = "CPU Ratio (P-Core)", Group = SettingGroup.Clocks, Min = 8, Max = 120, Decimals = 2,
+            RequireReadBack = true,
             Read = () => cpu?.ReadPCoreAllCoreRatio(),
             Write = cpu == null ? null : v => cpu.WritePCoreAllCoreRatio((int)Math.Round(v)),
             Note = "All-core P-core multiplier (MSR 0x1AD turbo ratio table). Use Per Core Ratio for the per-active-core-count table.",
@@ -278,6 +297,7 @@ public sealed class HardwareModel : IDisposable
         Settings.Add(new Setting
         {
             Id = "ecore_ratio", Name = "E-Core Ratio", Group = SettingGroup.Clocks, Min = 8, Max = 120, Decimals = 2,
+            RequireReadBack = true,
             Read = () => cpu is { ECoreCount: > 0 } ? cpu.ReadECoreAllCoreRatio() : null,
             Write = cpu is { ECoreCount: > 0 } ? v => cpu.WriteECoreAllCoreRatio((int)Math.Round(v)) : null,
             Note = "All-core E-core multiplier (MSR 0x650).",
@@ -286,9 +306,10 @@ public sealed class HardwareModel : IDisposable
         Settings.Add(new Setting
         {
             Id = "ring_ratio", Name = "Ring Ratio", Group = SettingGroup.Clocks, Min = 4, Max = 120, Decimals = 1,
+            RequireReadBack = true,
             Read = () => cpu?.ReadRingRatio().max,
             Write = cpu == null ? null : v => cpu.WriteRingRatio((int)Math.Round(v)),
-            Note = "Maximum ring/uncore multiplier. Written to the OC mailbox ring domain and MSR 0x620; on Alder/Raptor Lake only the mailbox value takes effect.",
+            Note = "Maximum ring/uncore multiplier. Verifies MSR 0x620 and updates the additional mailbox ceiling when one is reported. The running ring clock can be lower than this limit.",
             Available = cpu != null
         });
         AddBclkRow();
@@ -366,25 +387,17 @@ public sealed class HardwareModel : IDisposable
                     // target bits 19:8 while bit 20 is clear; hiding it as Auto loses a real value.
                     if (s.TargetVolts > 0) return s.TargetVolts;
 
-                    // Ring and cores share the IA voltage rail on LGA1700. A stock/adaptive ring
-                    // domain encodes a zero target, which used to render as Auto even though the
-                    // shared rail has a real readable voltage. Prefer the stable MSI regulator
-                    // target, then the measured rail, then the CPU's current VID.
-                    if (domain == OcMailbox.DOMAIN_RING)
-                    {
-                        if (CoreVoltage?.ReadTargetVolts() is double target) return target;
-                        if (SuperIo?.ReadVcore() is double rail && rail is > 0.4 and < 2.5) return rail;
-                        try { return cpu?.ReadPerfStatus(cpu.FirstPThread).vid; } catch { }
-                    }
+                    // This editor represents the programmed target, never live VID or a shared rail.
+                    // Showing telemetry here makes Apply skip a real requested override.
                     return null;
                 },
                 Write = mbOk && rowAvailable ? v => WriteOverride(domain, v) : null,
                 RestoreDefault = mbOk && rowAvailable ? () => ClearOverride(domain) : null,
-                Note = domain == OcMailbox.DOMAIN_CORE && CoreVoltage != null
+                Note = VoltageAccessRestriction ?? (domain == OcMailbox.DOMAIN_CORE && CoreVoltage != null
                     ? "CPU-core override written to both the MSI board regulator and Intel OC mailbox, in the same order as MSI Dragon Power. Both targets are read back; a failure rolls the regulator back. Enter 0 to return to adaptive mode."
                     : domain == OcMailbox.DOMAIN_RING
-                    ? "Ring override through Intel OC mailbox domain 2. While the domain is adaptive and has no encoded target, the displayed number is read from the shared IA/core voltage rail instead of showing Auto."
-                    : $"Programmed voltage target for domain {domain} through the Intel OC mailbox. Entering a value selects override mode; the board's load-line still affects the measured rail. Enter 0 to return to adaptive mode.",
+                    ? "Programmed ring override through Intel OC mailbox domain 2. Auto means no explicit target. Live VID is shown separately and is not measured Vcore."
+                    : $"Programmed voltage target for domain {domain} through the Intel OC mailbox. Entering a value selects override mode; the board's load-line still affects the measured rail. Enter 0 to return to adaptive mode."),
                 Available = mbOk && rowAvailable
             });
             Settings.Add(new Setting
@@ -392,18 +405,66 @@ public sealed class HardwareModel : IDisposable
                 Id = idPrefix + "_off", Name = name + " Voltage Offset", Group = SettingGroup.Voltages, Unit = "mV", Min = -500, Max = 500, Decimals = 0,
                 Read = () => (!mbOk || !available) ? null : Math.Round(mb!.ReadDomain(domain).OffsetVolts * 1000),
                 Write = mbOk && available ? v => mb!.SetOffset(domain, v / 1000.0) : null,
-                Note = $"Adaptive offset for FIVR domain {domain} (mailbox 0x150). Negative values undervolt.",
+                Note = VoltageAccessRestriction ?? $"Adaptive offset for FIVR domain {domain} (mailbox 0x150). Negative values undervolt.",
                 Available = mbOk && available
             });
         }
         bool DomainReadable(int d) { try { mb!.ReadDomain(d); return true; } catch { return false; } }
         AddDomain("core", "CPU Core", OcMailbox.DOMAIN_CORE, 0.600, 1.720, mbOk && DomainReadable(OcMailbox.DOMAIN_CORE));
+        if (AsusControl is { BaselineSvid: not null } asus)
+        {
+            int index = Settings.FindIndex(s => s.Id == "core_v");
+            Settings[index] = new Setting
+            {
+                Id = "core_v", Name = "CPU Core Voltage target", Group = SettingGroup.Voltages, Unit = "V",
+                Min = 0.6, Max = 1.7, Decimals = 3, Read = asus.ReadCoreTarget, Write = asus.SetCoreVoltage,
+                RestoreDefault = () => asus.SetSvid(asus.BaselineSvid!), RequireReadBack = true,
+                Note = "ASUS Global Core SVID Manual request, not a measured voltage. The applied target is read back from ASUS; measured Vcore is shown below it. The difference can vary with board regulation and load, even with BIOS settings on Auto. No automatic voltage compensation is applied. Enter 0 to restore the starting ASUS voltage state."
+            };
+            index = Settings.FindIndex(s => s.Id == "core_off");
+            Settings[index] = new Setting
+            {
+                Id = "core_off", Name = "CPU Core Voltage Offset", Group = SettingGroup.Voltages, Unit = "mV",
+                Min = -500, Max = 500, Decimals = 0, RequireReadBack = true,
+                Read = () => (double)asus.ReadSvid().OffsetIndex - 999,
+                Write = v =>
+                {
+                    var state = asus.ReadSvid();
+                    if (state.Mode != 0) throw new IOException("ASUS core voltage is in Manual mode; restore CPU Core to Auto before changing its adaptive offset.");
+                    asus.SetSvid(state with { OffsetIndex = checked((uint)Math.Round(v + 999)) });
+                },
+                Note = "ASUS adaptive SVID offset. Available for changes while CPU Core is in Auto/adaptive mode."
+            };
+        }
         // Not gated on the E-core count: the L2 rail for that cluster exists and is settable even
         // when the E-cores are switched off in the BIOS, which is exactly what the vendor tool shows.
         AddDomain("ecore", "CPU E-Core L2", OcMailbox.DOMAIN_ECORE, 0.600, 1.520, mbOk && DomainReadable(OcMailbox.DOMAIN_ECORE));
         AddDomain("ring", "Ring", OcMailbox.DOMAIN_RING, 0.600, 1.520, mbOk && DomainReadable(OcMailbox.DOMAIN_RING));
         AddDomain("sa", "SA", OcMailbox.DOMAIN_SA, 0.600, 1.520, mbOk && DomainReadable(OcMailbox.DOMAIN_SA));
         AddDomain("gt", "GT (iGPU)", OcMailbox.DOMAIN_GT, 0.600, 1.520, mbOk && DomainReadable(OcMailbox.DOMAIN_GT));
+
+        if (AsusControl is { } asusRails)
+        {
+            void AddAsusRail(string prefix, string name, uint id, AsusBoardControl.SvidState? baseline)
+            {
+                if (baseline == null) return;
+                int index = Settings.FindIndex(s => s.Id == prefix + "_v");
+                Settings[index] = new Setting
+                {
+                    Id = prefix + "_v", Name = name + " Voltage" + (id == AsusBoardControl.RingId ? " target" : ""), Group = SettingGroup.Voltages, Unit = "V",
+                    Min = 0.7, Max = 1.52, Decimals = 3, RequireReadBack = true,
+                    Read = () => asusRails.ReadVoltageTarget(id), Write = v => asusRails.SetRailVoltage(id, v),
+                    RestoreDefault = () => asusRails.SetSvid(baseline, id),
+                    Note = "ASUS Manual voltage target through the board's dedicated control. Mode, target and offset are read back together; a failed request restores the previous state. Enter 0 to restore the startup state. " +
+                        (id == AsusBoardControl.RingId
+                            ? "Cache SVID request: ring and cores share the Vcore rail. There is no separate measured ring voltage; lowering this request alone may not lower Vcore."
+                            : "The Log shows the separate ASUS rail reading.")
+                };
+            }
+            AddAsusRail("sa", "SA", AsusBoardControl.SaId, asusRails.BaselineSa);
+            AddAsusRail("ecore", "CPU E-Core L2", AsusBoardControl.L2Id, asusRails.BaselineL2);
+            AddAsusRail("ring", "Ring", AsusBoardControl.RingId, asusRails.BaselineRing);
+        }
 
         // ---------------- power limits ----------------
         if (cpu != null)
@@ -449,7 +510,9 @@ public sealed class HardwareModel : IDisposable
                 if (!control.Restore()) throw new InvalidOperationException(control.Status);
                 MeasureBclk();
             },
-            Note = control == null
+            Note = AsusControl != null && control == null
+                ? "Measured physical BCLK. The ASUS scalar target read back during testing, but the physical clock did not move. Live writes remain unavailable until a working clock-generator interface is verified."
+                : control == null
                 ? "Real core clocks counted against the ACPI timer, so it tracks a BCLK change made anywhere - including " +
                   "one made in the board vendor's tool while this is running. Read-only here: the write path goes through " +
                   "the board's own clock generator, which is only reachable where the board's EC exposes it."
@@ -624,6 +687,7 @@ public sealed class HardwareModel : IDisposable
         var sio = SuperIo;
         void AddBoardRail(string id, string name, int rail, string note)
         {
+            if (!sio.NamedRails.Any(r => r.index == rail)) return;
             if (sio.ReadVoltage(rail) is not double v || v < 0.05) return;
             Settings.Add(new Setting
             {
@@ -644,6 +708,8 @@ public sealed class HardwareModel : IDisposable
     /// </summary>
     private void AddVdd2Row(SuperIo sio)
     {
+        // MSI EC channel numbers are not labels for ASUS banked-Nuvoton inputs.
+        if (!sio.NamedRails.Any(r => r.index == Hardware.SuperIo.RailVdd2)) return;
         if (sio.ReadVoltage(Hardware.SuperIo.RailVdd2) is not double v || v < 0.05) return;
         var rail = Vdd2;
         Settings.Add(new Setting
@@ -718,7 +784,7 @@ public sealed class HardwareModel : IDisposable
     {
         if (!s.Available) return;
         try { s.Current = s.Read(); }
-        catch (Exception ex) { Emit($"{s.Name}: read failed - {ex.Message}"); }
+        catch (Exception ex) { s.Current = null; Emit($"{s.Name}: read failed - {ex.Message}"); }
     }
 
     /// <summary>Average VID over a few samples; idle VID jitters, so one reading is not enough.</summary>
@@ -740,13 +806,13 @@ public sealed class HardwareModel : IDisposable
     /// </summary>
     private (double mean, double spread)? SampleVcore(int samples = 6)
     {
-        if (SuperIo == null) return null;
+        if (SuperIo == null && AsusControl == null) return null;
         try
         {
             var vals = new List<double>(samples);
             for (int i = 0; i < samples; i++)
             {
-                if (SuperIo.ReadVcore() is double v && v is > 0.4 and < 2.5) vals.Add(v);
+                if ((AsusControl?.ReadVcore() ?? SuperIo?.ReadVcore()) is double v && v is > 0.4 and < 2.5) vals.Add(v);
                 Thread.Sleep(30);
             }
             return vals.Count == 0 ? null : (vals.Average(), vals.Max() - vals.Min());
@@ -760,10 +826,16 @@ public sealed class HardwareModel : IDisposable
     /// </summary>
     private static bool IsCoreVoltageRow(Setting s) => s.Id is "core_v" or "core_off";
 
-    /// <summary>Applies one value with the MSI-style rule that 0 restores the default captured at start-up.</summary>
+    /// <summary>Applies one value. Zero restores startup defaults.</summary>
     public bool Apply(Setting s, double value)
     {
-        if (s.Write == null) { Emit($"{s.Name}: read-only."); return false; }
+        s.LastError = null;
+        s.LastResult = null;
+        bool Fail(string message) { s.LastError = message; Emit($"{s.Name}: {message}"); return false; }
+        if (!s.Available || s.Write == null) return Fail("unavailable or read-only.");
+        if (!double.IsFinite(value)) return Fail("enter a finite number.");
+        if (s.Id is "cpu_ratio" or "ecore_ratio" or "ring_ratio" && value != Math.Truncate(value))
+            return Fail("enter a whole-number multiplier.");
         // A detected Super I/O does not necessarily have a valid Vcore channel. Do not claim a
         // rail check unless an actual plausible sample was captured. The MSI regulator path also
         // performs its own target-register readback.
@@ -777,31 +849,55 @@ public sealed class HardwareModel : IDisposable
             {
                 if (s.RestoreDefault != null) s.RestoreDefault();
                 else if (s.DefaultValue is double d) s.Write(d);
-                else { Emit($"{s.Name}: no default captured; nothing changed."); return false; }
+                else return Fail("no default captured; nothing changed.");
                 Refresh(s);
+                if (s.RequireReadBack && s.DefaultValue is double expected && s.Current != expected)
+                    return Fail($"reset could not be verified (expected {s.Format(expected)}, read {s.CurrentText}).");
+                s.LastResult = "restored";
+                if (IsCoreVoltageRow(s)) CoreVoltageIgnored = false;
                 Emit($"{s.Name}: restored default ({s.CurrentText}{(s.Unit == "" ? "" : " " + s.Unit)}).");
                 return true;
             }
             if (value < s.Min || value > s.Max)
             {
-                Emit($"{s.Name}: {s.Format(value)} is outside {s.RangeText}.");
-                return false;
+                return Fail($"{s.Format(value)} is outside {s.RangeText}.");
             }
             s.Write(value);
             Refresh(s);
+            if (s.RequireReadBack && (s.Current is not double actual || Math.Abs(actual - value) > 0.5 * Math.Pow(10, -s.Decimals)))
+                return Fail($"request was not retained (requested {s.Format(value)}, read back {s.CurrentText}).");
             Emit($"{s.Name}: set to {s.Format(value)}{(s.Unit == "" ? "" : " " + s.Unit)} (now {s.CurrentText}).");
             if (s.Id == "core_v" && CoreVoltage != null)
             {
                 CoreVoltageIgnored = false;
                 Emit($"{s.Name}: MSI regulator and Intel mailbox both read back {s.CurrentText} V.");
             }
-            if (verify && VerifyAgainstRail(s, settingBefore, vidBefore, railBefore) == false) return false;
+            if (s.Id == "core_v" && AsusControl is { } asusControl)
+            {
+                CoreVoltageIgnored = false;
+                Emit($"ASUS Manual SVID target {s.CurrentText} V retained; ASUS measured Vcore {asusControl.ReadVcore():0.000} V. Measured rail and requested target are different quantities; load-line behavior affects the rail.");
+            }
+            else if (s.Id is "sa_v" or "ecore_v" && AsusControl is { } asusRail)
+            {
+                uint id = s.Id == "sa_v" ? AsusBoardControl.SaId : AsusBoardControl.L2Id;
+                Emit($"ASUS {s.Name} target {s.CurrentText} V retained; board sensor {asusRail.ReadRailVoltage(id):0.000} V.");
+            }
+            else if (s.Id == "ring_v" && AsusControl is { } asusRing)
+            {
+                Emit($"ASUS Cache SVID target {s.CurrentText} V retained. Shared Vcore sensor {asusRing.ReadVcore():0.000} V; this is not a separate ring-voltage measurement.");
+            }
+            else if (verify && VerifyAgainstRail(s, settingBefore, vidBefore, railBefore) == false)
+                return Fail("request read back; Vcore response could not be verified (see Log).");
+            s.LastResult = Cpu != null && (s.RequireReadBack || s.Group == SettingGroup.Voltages)
+                ? "read back" : "applied";
+            if (Cpu != null && s.Group == SettingGroup.Voltages && !verify && !(AsusControl != null && s.Id is "sa_v" or "ecore_v" or "ring_v"))
+                Emit($"{s.Name}: register readback verified; actual rail voltage is unverified on this board.");
             return true;
         }
         catch (Exception ex)
         {
-            Emit($"{s.Name}: {ex.Message}");
-            return false;
+            Refresh(s);
+            return Fail(ex.Message);
         }
     }
 
@@ -838,22 +934,24 @@ public sealed class HardwareModel : IDisposable
             return true;
         }
         CoreVoltageIgnored = true;
-        Emit($"{s.Name}: NOT APPLIED at the rail. The requested target moved {expectedMv:+0;-0} mV (VID {dVid:+0;-0} mV) but measured Vcore moved {dRail:+0;-0} mV " +
-             $"(still {r1.mean:0.000} V, rail noise +/-{noise:0} mV). The board is holding the VRM at a fixed voltage, so the CPU's request is ignored. " +
-             "The mailbox readback changed but this board did not follow it; restore the value and use the board BIOS/vendor control for this configuration.");
+        Emit($"{s.Name}: rail response unverified. The requested target moved {expectedMv:+0;-0} mV (VID {dVid:+0;-0} mV), and measured Vcore moved {dRail:+0;-0} mV " +
+             $"(now {r1.mean:0.000} V, noise threshold {noise:0} mV). Load changes and monitor resolution can obscure the response; these samples do not establish the cause. " +
+             "The programmed target remains changed. Check measured Vcore under a consistent load or restore the starting setting.");
         return false;
     }
 
     /// <summary>Set when an apply was measured not to reach the rail.</summary>
     public bool CoreVoltageIgnored { get; private set; }
 
-    public void RestoreAllDefaults()
+    public int RestoreAllDefaults()
     {
+        int failures = 0;
         foreach (var s in Settings.Where(s => s.Available && !s.ReadOnly))
         {
             bool changed = s.Current != s.DefaultValue;
-            if (changed) Apply(s, 0);
+            if (changed && !Apply(s, 0)) failures++;
         }
+        return failures;
     }
 
     // ---------------------------------------------------------------- live
@@ -861,7 +959,7 @@ public sealed class HardwareModel : IDisposable
     {
         var st = new LiveStatus();
         st.BclkMHz = LastBclk;
-        try { st.VcoreVrm = SuperIo?.ReadVcore(); } catch { }
+        try { st.VcoreVrm = AsusControl?.ReadVcore() ?? SuperIo?.ReadVcore(); } catch { }
         if (Cpu != null)
         {
             try { st.PackageTempC = Cpu.ReadPackageTemperature(); } catch { }
@@ -874,6 +972,7 @@ public sealed class HardwareModel : IDisposable
             }
             catch { }
             try { st.RingRatio = Cpu.ReadCurrentRingRatio(); } catch { }
+            try { st.ECoreRatio = Cpu.ReadMaxCurrentERatio(); } catch { }
             try { st.PackageWatts = PowerFromEnergy(Cpu.ReadPackageEnergyJoules()); } catch { }
         }
         else if (Amd != null)
@@ -930,6 +1029,7 @@ public sealed class HardwareModel : IDisposable
 
     public void Dispose()
     {
+        AsusControl?.Dispose();
         CoreVoltage?.Dispose();
         SuperIo?.Dispose();
         Bclk?.Dispose();

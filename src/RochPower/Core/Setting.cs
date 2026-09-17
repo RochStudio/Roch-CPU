@@ -22,9 +22,12 @@ public sealed class Setting
     public Action? RestoreDefault { get; init; }
     public string? Note { get; init; }
     public bool Available { get; set; } = true;
+    public bool RequireReadBack { get; init; }
 
     public double? DefaultValue { get; set; }
     public double? Current { get; set; }
+    public string? LastError { get; set; }
+    public string? LastResult { get; set; }
 
     public bool ReadOnly => Write == null;
 
@@ -42,6 +45,6 @@ public sealed class Setting
     {
         text = text.Trim().Replace(',', '.');
         if (text.Equals("auto", StringComparison.OrdinalIgnoreCase)) { value = 0; return true; }
-        return double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value);
+        return double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value) && double.IsFinite(value);
     }
 }

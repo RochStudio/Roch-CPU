@@ -36,6 +36,7 @@ public sealed class IntelCpu
     public int Model { get; }
     public int Stepping { get; }
     public bool IsHybrid { get; }
+    public bool HypervisorPresent { get; }
     public IReadOnlyList<LogicalCpu> LogicalCpus { get; }
     public int PCoreCount { get; }
     public int ECoreCount { get; }
@@ -52,11 +53,14 @@ public sealed class IntelCpu
     public int TjMax { get; }
     public uint MicrocodeRevision { get; }
 
-    public IntelCpu(IKernelDriver driver)
+    public IntelCpu(IKernelDriver driver) : this(driver, EnumerateTopology()) { }
+
+    internal IntelCpu(IKernelDriver driver, IReadOnlyList<LogicalCpu> topology)
     {
         _drv = driver;
         BrandString = ReadBrandString();
         var l1 = X86Base.CpuId(1, 0);
+        HypervisorPresent = ((uint)l1.Ecx & (1u << 31)) != 0;
         int family = (l1.Eax >> 8) & 0xF, model = (l1.Eax >> 4) & 0xF;
         int extFamily = (l1.Eax >> 20) & 0xFF, extModel = (l1.Eax >> 16) & 0xF;
         if (family == 0xF) family += extFamily;
@@ -76,7 +80,7 @@ public sealed class IntelCpu
             _ => ($"Family 6 Model 0x{Model:X2}", false)
         };
 
-        LogicalCpus = EnumerateTopology();
+        LogicalCpus = topology;
         PCoreCount = LogicalCpus.Where(c => c.IsPCore).Select(c => c.CoreId).Distinct().Count();
         ECoreCount = LogicalCpus.Where(c => !c.IsPCore).Select(c => c.CoreId).Distinct().Count();
         FirstPThread = LogicalCpus.FirstOrDefault(c => c.IsPCore)?.Index ?? 0;
@@ -154,7 +158,33 @@ public sealed class IntelCpu
 
     private void WriteOrThrow(uint msr, ulong v, int cpu)
     {
-        if (!_drv.WriteMsr(msr, v, cpu)) throw new IOException($"WRMSR 0x{msr:X} failed on CPU {cpu} (locked by BIOS or not supported).");
+        if (!_drv.WriteMsr(msr, v, cpu)) throw new IOException($"WRMSR 0x{msr:X} failed on CPU {cpu}: {_drv.LastError}. The driver or firmware rejected this register write.");
+    }
+
+    private void WriteVerified(uint msr, ulong value, int cpu)
+    {
+        ulong before = ReadOrThrow(msr, cpu);
+        WriteOrThrow(msr, value, cpu);
+        try
+        {
+            ulong actual = ReadOrThrow(msr, cpu);
+            if (actual != value)
+                throw new IOException($"MSR 0x{msr:X} ignored the request: requested 0x{value:X16}, read back 0x{actual:X16}.");
+        }
+        catch (Exception ex)
+        {
+            bool restored = _drv.WriteMsr(msr, before, cpu) && _drv.ReadMsr(msr, out ulong restoredValue, cpu) && restoredValue == before;
+            throw new IOException(ex.Message + (restored ? " Previous register value restored." : " Restore could not be verified."), ex);
+        }
+    }
+
+    private static ulong EncodeRatios(int[] ratios)
+    {
+        if (ratios.Length != 8 || ratios.Any(r => r < 8 || r > 120))
+            throw new ArgumentException("Every turbo group needs an integer ratio between 8 and 120.", nameof(ratios));
+        ulong value = 0;
+        for (int i = 0; i < 8; i++) value |= (ulong)ratios[i] << (8 * i);
+        return value;
     }
 
     /// <summary>MSR_FLEX_RATIO bit 20: BIOS locked overclocking (typical on non-Z chipsets).</summary>
@@ -178,22 +208,23 @@ public sealed class IntelCpu
     public (int[] ratios, int[] cores) ReadECoreTurboTable()
     {
         if (ECoreCount == 0) return (Array.Empty<int>(), Array.Empty<int>());
-        ulong r = ReadOrThrow(MSR_ATOM_TURBO_RATIO_LIMIT, FirstPThread);
+        ulong r = ReadOrThrow(MSR_ATOM_TURBO_RATIO_LIMIT, FirstEThread);
         int[] ratios = new int[8], cores = new int[8];
-        bool haveCores = _drv.ReadMsr(MSR_ATOM_TURBO_RATIO_LIMIT_CORES, out ulong c, FirstPThread);
+        bool haveCores = _drv.ReadMsr(MSR_ATOM_TURBO_RATIO_LIMIT_CORES, out ulong c, FirstEThread);
         for (int i = 0; i < 8; i++)
         {
             ratios[i] = (int)((r >> (8 * i)) & 0xFF);
-            cores[i] = haveCores ? (int)((c >> (8 * i)) & 0xFF) : (i + 1) * 4;
+            int count = haveCores ? (int)((c >> (8 * i)) & 0xFF) : 0;
+            cores[i] = count > 0 && count <= ECoreCount ? count : 0; // 0xFF is not 255 active cores.
         }
         return (ratios, cores);
     }
 
     public void WritePCoreTurboTable(int[] ratios)
     {
-        ulong v = 0;
-        for (int i = 0; i < 8; i++) v |= (ulong)(byte)ratios[i] << (8 * i);
-        WriteOrThrow(MSR_TURBO_RATIO_LIMIT, v, FirstPThread);
+        ulong v = EncodeRatios(ratios);
+        ulong before = ReadOrThrow(MSR_TURBO_RATIO_LIMIT, FirstPThread);
+        WriteVerified(MSR_TURBO_RATIO_LIMIT, v, FirstPThread);
         // The OC mailbox carries its own ceiling for the core domain; raise it when the table goes above it.
         int wanted = ratios.Max();
         try
@@ -201,15 +232,31 @@ public sealed class IntelCpu
             var d = Mailbox.ReadDomain(OcMailbox.DOMAIN_CORE);
             if (d.MaxRatio > 0 && d.MaxRatio < wanted) { d.MaxRatio = wanted; Mailbox.WriteDomain(OcMailbox.DOMAIN_CORE, d); }
         }
-        catch { /* mailbox unavailable: the MSR write alone is all this platform offers */ }
+        catch (Exception ex)
+        {
+            bool restored = _drv.WriteMsr(MSR_TURBO_RATIO_LIMIT, before, FirstPThread)
+                && _drv.ReadMsr(MSR_TURBO_RATIO_LIMIT, out ulong actual, FirstPThread) && actual == before;
+            throw new IOException("OC mailbox ceiling could not be verified: " + ex.Message +
+                (restored ? " Previous turbo table restored." : " Turbo-table restore could not be verified."), ex);
+        }
     }
 
     public void WriteECoreTurboTable(int[] ratios)
     {
         if (ECoreCount == 0) return;
+        var (current, _) = ReadECoreTurboTable();
+        if (ratios.Length != 8 || !current.Any(r => r > 0))
+            throw new ArgumentException("No usable eight-entry E-core table.", nameof(ratios));
         ulong v = 0;
-        for (int i = 0; i < 8; i++) v |= (ulong)(byte)ratios[i] << (8 * i);
-        WriteOrThrow(MSR_ATOM_TURBO_RATIO_LIMIT, v, FirstPThread);
+        for (int i = 0; i < 8; i++)
+        {
+            // Firmware can expose one populated group and seven zero entries.
+            // Keep inactive entries zero instead of inventing additional turbo groups.
+            if (current[i] == 0 ? ratios[i] != 0 : ratios[i] < 8 || ratios[i] > 120)
+                throw new ArgumentException("Active E-core groups require ratios 8–120; inactive groups must remain zero.", nameof(ratios));
+            v |= (ulong)ratios[i] << (8 * i);
+        }
+        WriteVerified(MSR_ATOM_TURBO_RATIO_LIMIT, v, FirstEThread);
     }
 
     /// <summary>The all-core P ratio: the lowest entry of the turbo table (largest active-core group).</summary>
@@ -226,13 +273,18 @@ public sealed class IntelCpu
     }
 
     public void WritePCoreAllCoreRatio(int ratio) => WritePCoreTurboTable(Enumerable.Repeat(ratio, 8).ToArray());
-    public void WriteECoreAllCoreRatio(int ratio) => WriteECoreTurboTable(Enumerable.Repeat(ratio, 8).ToArray());
+    public void WriteECoreAllCoreRatio(int ratio)
+    {
+        if (ratio < 8 || ratio > 120) throw new ArgumentOutOfRangeException(nameof(ratio));
+        var (current, _) = ReadECoreTurboTable();
+        WriteECoreTurboTable(current.Select(r => r == 0 ? 0 : ratio).ToArray());
+    }
 
     // ------------------------------------------------------------- ring
     /// <summary>
-    /// Effective ring limit. Alder/Raptor Lake take the ceiling from the OC mailbox ring
-    /// domain, not from MSR 0x620 (verified: 0x620 alone changes nothing, the mailbox does),
-    /// so the effective maximum is the lower of the two.
+    /// Programmed ring limit. Some boards (including the tested MSI Z790) expose an
+    /// additional mailbox ceiling. Only include it when the mailbox reports a nonzero ratio.
+    /// This is a configured limit, not a measurement of the running ring clock.
     /// </summary>
     public (int max, int min) ReadRingRatio()
     {
@@ -249,19 +301,34 @@ public sealed class IntelCpu
 
     public void WriteRingRatio(int max, int? min = null)
     {
+        if (max < 4 || max > 120 || min is < 0 or > 120 || min > max)
+            throw new ArgumentOutOfRangeException(nameof(max), "Invalid ring ratio range.");
         ulong v = ReadOrThrow(MSR_UNCORE_RATIO_LIMIT, FirstPThread);
+        ulong before = v;
         int curMin = (int)((v >> 8) & 0x7F);
         v = (v & ~0x7FUL) | (uint)(max & 0x7F);
         int newMin = min ?? Math.Min(curMin, max); // never leave min above max
         v = (v & ~(0x7FUL << 8)) | ((ulong)(newMin & 0x7F) << 8);
-        WriteOrThrow(MSR_UNCORE_RATIO_LIMIT, v, FirstPThread);
+        WriteVerified(MSR_UNCORE_RATIO_LIMIT, v, FirstPThread);
         try
         {
             var d = Mailbox.ReadDomain(OcMailbox.DOMAIN_RING);
-            d.MaxRatio = max;
-            Mailbox.WriteDomain(OcMailbox.DOMAIN_RING, d);
+            // ASUS can report a completely empty domain here;
+            // do not turn a verified MSR write into an unrelated failed VF write.
+            // Preserve the mailbox path on boards that expose it (tested on MSI).
+            if (OcMailbox.Encode(d) != 0)
+            {
+                d.MaxRatio = max;
+                Mailbox.WriteDomain(OcMailbox.DOMAIN_RING, d);
+            }
         }
-        catch (Exception ex) { throw new IOException($"Ring ratio: MSR 0x620 accepted {max} but the OC mailbox ring domain rejected it ({ex.Message}).", ex); }
+        catch (Exception ex)
+        {
+            bool restored = _drv.WriteMsr(MSR_UNCORE_RATIO_LIMIT, before, FirstPThread)
+                && _drv.ReadMsr(MSR_UNCORE_RATIO_LIMIT, out ulong actual, FirstPThread) && actual == before;
+            throw new IOException($"Ring ratio mailbox failed ({ex.Message}). " +
+                (restored ? "Previous ring register restored." : "Ring-register restore could not be verified."), ex);
+        }
     }
 
     public int ReadCurrentRingRatio() =>
@@ -281,6 +348,15 @@ public sealed class IntelCpu
         int max = 0;
         foreach (var c in LogicalCpus.Where(c => c.IsPCore))
             if (_drv.ReadMsr(MSR_IA32_PERF_STATUS, out ulong v, c.Index)) max = Math.Max(max, (int)((v >> 8) & 0xFF));
+        return max;
+    }
+
+    public int? ReadMaxCurrentERatio()
+    {
+        int? max = null;
+        foreach (var c in LogicalCpus.Where(c => !c.IsPCore))
+            if (_drv.ReadMsr(MSR_IA32_PERF_STATUS, out ulong v, c.Index))
+                max = Math.Max(max ?? 0, (int)((v >> 8) & 0xFF));
         return max;
     }
 
@@ -328,7 +404,7 @@ public sealed class IntelCpu
             ulong raw = (ulong)Math.Round(p2 / unit) & 0x7FFF;
             v = (v & ~(0x7FFFUL << 32)) | (raw << 32) | (1UL << 47);
         }
-        WriteOrThrow(MSR_PKG_POWER_LIMIT, v, FirstPThread);
+        WriteVerified(MSR_PKG_POWER_LIMIT, v, FirstPThread);
     }
 
     public double ReadPackageEnergyJoules()

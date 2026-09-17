@@ -17,6 +17,9 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
+      - name: Regression checks
+        run: dotnet run --project tests/RochPower.Tests/RochPower.Tests.csproj -c Release
+
       - name: Build
         run: dotnet publish src/RochPower/RochPower.csproj -c Release -r win-x64 --self-contained false -o dist
 

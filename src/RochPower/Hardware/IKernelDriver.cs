@@ -9,6 +9,8 @@ public interface IKernelDriver : IDisposable
 {
     string Name { get; }
     bool IsOpen { get; }
+    /// <summary>Detail for the last failed driver operation, when available.</summary>
+    string? LastError => null;
 
     /// <summary>Read an MSR on the logical CPU <paramref name="cpu"/> (-1 = whichever CPU we are on).</summary>
     bool ReadMsr(uint index, out ulong value, int cpu = -1);

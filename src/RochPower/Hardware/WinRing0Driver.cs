@@ -247,7 +247,11 @@ public sealed unsafe class WinRing0Driver : IKernelDriver
         lock (_ioLock)
         {
             bool ok = Native.DeviceIoControl(_handle!, code, input, inSize, output, outSize, out _, IntPtr.Zero);
-            if (!ok) LastError = new Win32Exception(Marshal.GetLastWin32Error()).Message;
+            if (!ok)
+            {
+                int error = Marshal.GetLastWin32Error();
+                LastError = $"{new Win32Exception(error).Message} (Win32 {error})";
+            }
             return ok;
         }
     }
@@ -255,9 +259,16 @@ public sealed unsafe class WinRing0Driver : IKernelDriver
     /// <summary>Pins the calling thread to one logical CPU for the duration of <paramref name="action"/>.</summary>
     public static T RunOnCpu<T>(int cpu, Func<T> action)
     {
-        if (cpu < 0 || cpu >= 64) return action();
+        if (cpu < 0) return action();
+        if (cpu >= 64) throw new ArgumentOutOfRangeException(nameof(cpu), "Processor-group addressing is required above logical CPU 63.");
         Thread.BeginThreadAffinity();
         UIntPtr previous = Native.SetThreadAffinityMask(Native.GetCurrentThread(), (UIntPtr)(1UL << cpu));
+        if (previous == UIntPtr.Zero)
+        {
+            int error = Marshal.GetLastWin32Error();
+            Thread.EndThreadAffinity();
+            throw new Win32Exception(error, $"Could not select logical CPU {cpu}; hardware access was not attempted.");
+        }
         try { return action(); }
         finally
         {

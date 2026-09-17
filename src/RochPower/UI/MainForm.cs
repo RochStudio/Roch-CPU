@@ -7,7 +7,7 @@ namespace RochPower.UI;
 public sealed class MainForm : Form
 {
     public const string AppName = "Roch CPU";
-    public const string AppVersion = "1.0.3";
+    public const string AppVersion = "1.0.4";
     private const int ResizeBorder = 6;
 
     private readonly HardwareModel _hw = new();
@@ -19,6 +19,8 @@ public sealed class MainForm : Form
     private readonly Label _lblMicrocode = Theme.Muted_("");
     private readonly Label _lblBoard = Theme.Muted_("");
     private readonly Label _lblBios = Theme.Muted_("");
+    private readonly Label _lblLive = Theme.Muted_("");
+    private readonly ToolTip _resultTip = new() { AutoPopDelay = 30000 };
     private readonly Label _lblWarn = Theme.Label("", Theme.Small, Theme.Warn);
     private readonly Button _btnLog = Theme.Button("Log");
     private readonly Button _btnTheme = Theme.Button(Theme.IsDark ? "Light" : "Dark");
@@ -33,6 +35,7 @@ public sealed class MainForm : Form
     private readonly Dictionary<Setting, TextBox> _boxes = new();
     private readonly Dictionary<Setting, Label> _statusLabels = new();
     private readonly Dictionary<Setting, Label> _rangeLabels = new();
+    private Label? _coreVoltageComparison;
 
     private readonly Button _btnApply = Theme.Button("Apply", primary: true);
     private readonly Button _btnReset = Theme.Button("Reset");
@@ -135,7 +138,10 @@ public sealed class MainForm : Form
         header.Controls.Add(_lblMicrocode, 0, 2);
         header.Controls.Add(_lblBoard, 0, 3);
         header.Controls.Add(_lblBios, 0, 4);
-        header.Controls.Add(_lblWarn, 0, 5);
+        header.Controls.Add(_lblLive, 0, 5);
+        header.SetColumnSpan(_lblLive, 2);
+        header.Controls.Add(_lblWarn, 0, 6);
+        _lblWarn.MaximumSize = new Size(620, 0);
         header.SetColumnSpan(_lblWarn, 2);
         _body.Controls.Add(header, 0, 0);
 
@@ -221,6 +227,7 @@ public sealed class MainForm : Form
         _rows.Controls.Clear();
         _rows.RowStyles.Clear();
         _boxes.Clear(); _statusLabels.Clear(); _rangeLabels.Clear();
+        _coreVoltageComparison = null;
         SettingGroup? last = null;
         TableLayoutPanel? section = null;
         foreach (var s in _hw.Settings)
@@ -247,7 +254,7 @@ public sealed class MainForm : Form
                 };
                 var heading = Theme.SectionTitle(s.Group switch
                 {
-                    SettingGroup.Clocks => "Clocks", SettingGroup.Voltages => "Voltages (FIVR / OC mailbox)",
+                    SettingGroup.Clocks => "Clocks", SettingGroup.Voltages => "Voltages",
                     SettingGroup.Power => "Power",
                     SettingGroup.Pbo => "Precision Boost",
                     SettingGroup.Memory => "Memory",
@@ -291,6 +298,16 @@ public sealed class MainForm : Form
             row.Controls.Add(range, 3, 0);
             if (s.Note != null) { var tip = new ToolTip { AutoPopDelay = 20000 }; tip.SetToolTip(name, s.Note); tip.SetToolTip(box, s.Note); tip.SetToolTip(range, s.Note); }
             section!.Controls.Add(row);
+            if (s.Id == "core_v" && _hw.AsusControl != null)
+            {
+                _coreVoltageComparison = Theme.Muted_("Measured Vcore: waiting for sensor");
+                _coreVoltageComparison.Margin = new Padding(6, 0, 6, 5);
+                _coreVoltageComparison.Dock = DockStyle.Top;
+                _resultTip.SetToolTip(_coreVoltageComparison,
+                    "Live ASUS Vcore sensor. Difference is relative to the applied target, not an unsaved edit. " +
+                    "Sensor samples and load change over time; this is not a fixed calibration offset.");
+                section.Controls.Add(_coreVoltageComparison);
+            }
             _boxes[s] = box; _statusLabels[s] = range; _rangeLabels[s] = range;
         }
         _rows.ResumeLayout();
@@ -360,7 +377,12 @@ public sealed class MainForm : Form
         var warns = new List<string>();
         if (_hw.Driver == null) warns.Add("kernel driver not loaded, nothing can be read or written (see Log)");
         if (_hw.OcLocked) warns.Add("BIOS OC Lock set: ratio and voltage writes will be rejected");
-        if (_hw.Cpu != null && !_hw.MailboxAvailable) warns.Add("OC mailbox not responding: voltage rows disabled");
+        if (_hw.VoltageAccessRestriction != null) warns.Add("Windows Hyper-V blocked voltage access (see Log)");
+        else
+        {
+            if (_hw.Cpu != null && !_hw.MailboxAvailable) warns.Add("OC mailbox not responding: voltage rows disabled");
+            if (_hw.Cpu is { HypervisorPresent: true }) warns.Add("Hypervisor active: read-back values may not reach hardware (see Log)");
+        }
         if (_hw.Cpu is { IsLga1700Family: false }) warns.Add("not a known LGA1700 CPU");
         if (_hw.Amd is { IsSupported: false }) warns.Add("unknown Zen generation: SMU message numbers assumed");
         if (_hw.Amd != null && !_hw.SmuAvailable) warns.Add("SMU not responding: PBO rows disabled (see Log)");
@@ -429,6 +451,9 @@ public sealed class MainForm : Form
     private void SlowTick()
     {
         if (_hw.Cpu == null || _applying) return;
+        var live = _hw.ReadLive();
+        _lblLive.Text = $"Live: P x{live.CoreRatio?.ToString() ?? "?"} E x{live.ECoreRatio?.ToString() ?? "?"} Ring x{live.RingRatio?.ToString() ?? "?"} | VID {live.CoreVid?.ToString("0.000") ?? "?"} V | " +
+            (live.VcoreVrm is double rail ? $"Vcore {rail:0.000} V" : "Vcore unavailable");
         if (!_bclkBusy)
         {
             _bclkBusy = true;
@@ -455,6 +480,15 @@ public sealed class MainForm : Form
             if (box.Text != was) continue;
             _hw.Refresh(s);
             if (s.CurrentText != was) box.Text = s.CurrentText;
+        }
+        if (_coreVoltageComparison != null)
+        {
+            var core = _hw.Settings.FirstOrDefault(s => s.Id == "core_v");
+            _coreVoltageComparison.Text = live.VcoreVrm is double measured
+                ? $"Measured Vcore: {measured:0.000} V" +
+                    (core?.LastError == null && core?.Current is double target
+                        ? $" ({(measured - target) * 1000:+0;-0;0} mV vs applied target)" : "")
+                : "Measured Vcore: sensor unavailable";
         }
     }
 
@@ -517,7 +551,8 @@ public sealed class MainForm : Form
         {
             if (s.ReadOnly) continue;
             string text = box.Text.Trim();
-            if (text.Length == 0 || text.Equals(s.CurrentText, StringComparison.OrdinalIgnoreCase)) continue;
+            if (text.Length == 0) continue;
+            if (text.Equals(s.CurrentText, StringComparison.OrdinalIgnoreCase) && s.LastError == null) continue;
             if (!s.TryParse(text, out double value)) { AppendLog($"{s.Name}: '{text}' is not a number."); rejected++; SetRowStatus(s, "invalid", Theme.Danger); continue; }
             if (value != 0 && !ConfirmDangerous(s, value)) { SetRowStatus(s, "skipped", Theme.Muted); continue; }
             work.Add((s, box, value));
@@ -525,7 +560,7 @@ public sealed class MainForm : Form
 
         if (work.Count == 0)
         {
-            if (rejected == 0) SetStatus("Nothing to apply: no field differs from the hardware.", false);
+            if (rejected == 0) SetStatus("No edits to apply; displayed values are register readings.", false);
             else SetStatus($"Applied at {DateTime.Now:HH:mm:ss}  ·  0 ok, {rejected} failed", true);
             return;
         }
@@ -541,7 +576,7 @@ public sealed class MainForm : Form
                 if (ok && !ignored) applied++; else failed++;
                 BeginInvoke(() =>
                 {
-                    SetRowStatus(s, ignored ? "board ignored it" : ok ? "applied" : "failed", ok && !ignored ? Theme.Ok : Theme.Danger);
+                    SetRowStatus(s, ignored ? "board ignored it" : ok ? s.LastResult ?? "applied" : "failed - see Log", ok && !ignored ? Theme.Ok : Theme.Danger);
                     box.Text = s.CurrentText;
                 });
             }
@@ -580,7 +615,7 @@ public sealed class MainForm : Form
 
     private void SetRowStatus(Setting s, string text, Color color)
     {
-        if (_statusLabels.TryGetValue(s, out var l)) { l.Text = text; l.ForeColor = color; }
+        if (_statusLabels.TryGetValue(s, out var l)) { l.Text = text; l.ForeColor = color; _resultTip.SetToolTip(l, s.LastError ?? s.Note); }
     }
 
     private void RestoreDefaults()
@@ -591,15 +626,16 @@ public sealed class MainForm : Form
         // them a step at a time, measuring each, which is seconds of work.
         RunOnHardware("Restoring...", () =>
         {
-            _hw.RestoreAllDefaults();
+            int failures = _hw.RestoreAllDefaults();
             _hw.RefreshAll();
             BeginInvoke(() =>
             {
                 foreach (var (s, box) in _boxes) box.Text = s.CurrentText;
                 foreach (var (s, l) in _rangeLabels) { l.Text = s.ReadOnly ? "read-only" : s.RangeText; l.ForeColor = Theme.Muted; }
             });
-            AppendLog("Reset: start-up values restored.");
-            return ("Reset: start-up values restored.", false);
+            string result = failures == 0 ? "Reset: start-up values restored." : $"Reset: {failures} setting(s) failed; see Log.";
+            AppendLog(result);
+            return (result, failures > 0);
         });
     }
 

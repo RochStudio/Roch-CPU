@@ -78,6 +78,17 @@ public sealed class SuperIo : IDisposable
     // ---------------------------------------------------------------- detection
     public static SuperIo? TryCreate(IKernelDriver drv, out string status)
     {
+        // Configuration index/data ports are shared with other monitoring programs.
+        using var mutex = new Mutex(false, @"Global\Access_ISABUS.HTP.Method");
+        bool held;
+        try { held = mutex.WaitOne(300); } catch (AbandonedMutexException) { held = true; }
+        if (!held) { status = "Super I/O detection is busy in another monitor."; return null; }
+        try { return Detect(drv, out status); }
+        finally { mutex.ReleaseMutex(); }
+    }
+
+    private static SuperIo? Detect(IKernelDriver drv, out string status)
+    {
         var problems = new List<string>();
         foreach (ushort port in new ushort[] { 0x2E, 0x4E })
         {
@@ -108,7 +119,12 @@ public sealed class SuperIo : IDisposable
         byte id = Read(CHIP_ID_REGISTER), rev = Read(CHIP_REVISION_REGISTER);
         ushort chip = (ushort)((id << 8) | rev);
         var (kind, name) = IdentifyNuvoton(chip);
-        if (kind == SuperIoKind.None) { drv.WriteIoPortByte(port, NUVOTON_EXIT); return false; }
+        if (kind == SuperIoKind.None)
+        {
+            status = $"LPC 0x{port:X2} returned unrecognized Nuvoton ID 0x{chip:X4}";
+            drv.WriteIoPortByte(port, NUVOTON_EXIT);
+            return false;
+        }
 
         Write(DEVICE_SELECT_REGISTER, NUVOTON_HWM_LDN);
         ushort addr = (ushort)((Read(BASE_ADDRESS_REGISTER) << 8) | Read((byte)(BASE_ADDRESS_REGISTER + 1)));
@@ -121,7 +137,15 @@ public sealed class SuperIo : IDisposable
             status = $"{name} at LPC 0x{port:X2} but its monitor base did not read back stable (0x{addr:X4}/0x{verify:X4})";
             return false;
         }
-        result = new SuperIo(drv, port, addr, kind, name);
+        var detected = new SuperIo(drv, port, addr, kind, name);
+        result = detected;
+        if (kind == SuperIoKind.NuvotonBank && !detected.WithLock(() =>
+            detected.ReadByteBank(0x804F) == 0x5C && detected.ReadByteBank(0x004F) == 0xA3, false))
+        {
+            result.Dispose(); result = null;
+            status = $"{name} identified at LPC 0x{port:X2}, but monitor vendor ID could not be verified (I/O access may be locked)";
+            return false;
+        }
         status = $"{name} at LPC 0x{port:X2}, hardware monitor at 0x{addr:X4}";
         return true;
     }
@@ -136,7 +160,7 @@ public sealed class SuperIo : IDisposable
         0xD121 => (SuperIoKind.NuvotonBank, "Nuvoton NCT6793D"),
         0xD352 => (SuperIoKind.NuvotonBank, "Nuvoton NCT6795D"),
         0xD423 => (SuperIoKind.NuvotonBank, "Nuvoton NCT6796D"),
-        0xD428 => (SuperIoKind.NuvotonBank, "Nuvoton NCT6798D"),
+        0xD42B => (SuperIoKind.NuvotonBank, "Nuvoton NCT6798D"),
         0xD451 => (SuperIoKind.NuvotonBank, "Nuvoton NCT6797D"),
         0xD802 => (SuperIoKind.NuvotonBank, "Nuvoton NCT6799D"),
         _ => (SuperIoKind.None, "")

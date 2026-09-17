@@ -49,7 +49,7 @@ public sealed class PerCoreForm : Form
         var sync = Theme.Button("Same for all"); sync.Height = 30; sync.AutoSize = false; sync.Width = 100;
         apply.Click += (_, _) => Apply();
         close.Click += (_, _) => Close();
-        sync.Click += (_, _) => { foreach (var t in _p.Skip(1)) t.Text = _p[0].Text; foreach (var t in _e.Skip(1)) t.Text = _e[0].Text; };
+        sync.Click += (_, _) => { foreach (var t in _p.Skip(1)) t.Text = _p[0].Text; foreach (var t in _e.Skip(1).Where(t => t.Enabled)) t.Text = _e[0].Text; };
         buttons.Controls.Add(close); buttons.Controls.Add(apply); buttons.Controls.Add(sync);
         root.Controls.Add(buttons, 0, 4); root.SetColumnSpan(buttons, 2);
         Controls.Add(root);
@@ -82,7 +82,13 @@ public sealed class PerCoreForm : Form
             if (cpu.ECoreCount > 0)
             {
                 var (er, ec) = cpu.ReadECoreTurboTable();
-                for (int i = 0; i < 8; i++) { _e[i].Text = er[i].ToString(); _eLabels[i].Text = $"{ec[i]} E-core{(ec[i] == 1 ? "" : "s")} active"; }
+                for (int i = 0; i < 8; i++)
+                {
+                    _e[i].Enabled = er[i] > 0;
+                    _e[i].Text = er[i] > 0 ? er[i].ToString() : "N/A";
+                    _eLabels[i].Text = er[i] == 0 ? "Unused group" : er.Count(r => r > 0) == 1 ? "All E-cores"
+                        : ec[i] > 0 ? $"{ec[i]} E-core{(ec[i] == 1 ? "" : "s")} active" : $"E-core group {i + 1}";
+                }
             }
             else for (int i = 0; i < 8; i++) { _e[i].Text = "N/A"; _e[i].Enabled = false; _eLabels[i].ForeColor = Theme.Muted; }
             _status.Text = "Values read from the CPU.";
@@ -95,17 +101,18 @@ public sealed class PerCoreForm : Form
         var cpu = _hw.Cpu!;
         try
         {
-            int[] pr = _p.Select(b => int.TryParse(b.Text, out int v) ? Math.Clamp(v, 0, 255) : 0).ToArray();
-            if (pr.Any(v => v == 0)) throw new InvalidOperationException("Every P-core group needs a ratio between 8 and 120.");
+            int[] pr = _p.Select(b => int.TryParse(b.Text, out int v) ? v : 0).ToArray();
+            int[] er = _e.Select(b => int.TryParse(b.Text, out int v) ? v : 0).ToArray();
+            if (pr.Any(v => v < 8 || v > 120)) throw new InvalidOperationException("Every P-core group needs a ratio between 8 and 120.");
+            if (cpu.ECoreCount > 0 && _e.Where(b => b.Enabled).Any(b => !int.TryParse(b.Text, out int v) || v < 8 || v > 120))
+                throw new InvalidOperationException("Every E-core group needs a ratio between 8 and 120.");
             cpu.WritePCoreTurboTable(pr);
             if (cpu.ECoreCount > 0)
             {
-                int[] er = _e.Select(b => int.TryParse(b.Text, out int v) ? Math.Clamp(v, 0, 255) : 0).ToArray();
-                if (er.Any(v => v == 0)) throw new InvalidOperationException("Every E-core group needs a ratio between 8 and 120.");
                 cpu.WriteECoreTurboTable(er);
             }
             Fill();
-            _status.Text = $"Applied at {DateTime.Now:HH:mm:ss}."; _status.ForeColor = Theme.Muted;
+            _status.Text = $"Tables read back at {DateTime.Now:HH:mm:ss}; live clocks depend on CPU limits."; _status.ForeColor = Theme.Muted;
         }
         catch (Exception ex) { _status.Text = ex.Message; _status.ForeColor = Theme.Danger; }
     }

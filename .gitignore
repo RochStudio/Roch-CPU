@@ -4,6 +4,7 @@ dist/
 *.user
 *.suo
 .vs/
+.tools/
 Roch CPU.ini
 probe.txt
 vcore.txt

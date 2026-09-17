@@ -20,6 +20,38 @@ internal static class Program
         if (args.Length > 0 && args[0].Equals("--probe", StringComparison.OrdinalIgnoreCase))
             return Probe(args.Length > 1 ? args[1] : Path.Combine(AppContext.BaseDirectory, "probe.txt"));
 
+        if (args.Length > 0 && args[0].Equals("--intel-audit", StringComparison.OrdinalIgnoreCase))
+            return IntelAudit.Run(args.Length > 1 ? args[1] : Path.Combine(AppContext.BaseDirectory, "intel-audit.txt"));
+
+        if (args.Length > 0 && args[0] is "--asus-audit" or "--asus-bclk-validate")
+            return AsusAudit.Run(Path.Combine(AppContext.BaseDirectory, "asus-audit.txt"), args[0] == "--asus-bclk-validate");
+        if (args.Length > 0 && args[0] == "--asus-voltage-validate")
+            return AsusAudit.ValidateVoltage(Path.Combine(AppContext.BaseDirectory, "asus-voltage-validation.txt"));
+        if (args.Length > 0 && args[0] == "--asus-ring-voltage-validate")
+            return AsusAudit.ValidateRingVoltage(Path.Combine(AppContext.BaseDirectory, "asus-ring-voltage-validation.txt"));
+        if (args.Length > 2 && args[0] == "--asus-rail-validate")
+            return AsusAudit.ValidateRail(Path.Combine(AppContext.BaseDirectory, $"asus-{args[1]}-validation.txt"),
+                args[1] switch { "sa" => AsusBoardControl.SaId, "l2" => AsusBoardControl.L2Id, _ => 0u },
+                double.Parse(args[2], CultureInfo.InvariantCulture));
+
+        if (args.Length > 1 && args[0].Equals("--intel-validate", StringComparison.OrdinalIgnoreCase))
+            return IntelAudit.Validate(Path.Combine(AppContext.BaseDirectory, "intel-validation.txt"), double.Parse(args[1], CultureInfo.InvariantCulture));
+
+        if (args.Length > 0 && args[0].Equals("--ring-validate", StringComparison.OrdinalIgnoreCase))
+            return IntelAudit.ValidateRing(Path.Combine(AppContext.BaseDirectory, "ring-validation.txt"));
+
+        if (args.Length > 1 && args[0].Equals("--ecore-validate", StringComparison.OrdinalIgnoreCase))
+            return IntelAudit.ValidateECore(Path.Combine(AppContext.BaseDirectory, "ecore-validation.txt"), int.Parse(args[1], CultureInfo.InvariantCulture));
+
+        if (args.Length > 0 && args[0].Equals("--windows-audit", StringComparison.OrdinalIgnoreCase))
+        {
+            var restrictions = HypervisorRestrictions.ReadCurrentBoot(out string status);
+            File.WriteAllLines(Path.Combine(AppContext.BaseDirectory, "windows-audit.txt"),
+                new[] { status, HypervisorRestrictions.VoltageBlockReason(restrictions) ?? "No voltage restriction confirmed by the log." }
+                    .Concat(restrictions.Select(r => $"{r.TimeUtc:O} MSR 0x{r.Register:X} write={r.IsWrite} driver={r.Driver}")));
+            return 0;
+        }
+
         if (args.Length > 0 && args[0].Equals("--pm-dump", StringComparison.OrdinalIgnoreCase))
             return PmDump(args.Length > 1 ? args[1] : Path.Combine(AppContext.BaseDirectory, "pmtable.txt"));
 
@@ -635,11 +667,22 @@ internal static class Program
             Run with no arguments for the window. Everything below needs administrator rights.
 
             Reporting
-              --probe [file]        every register the tool relies on, plus no-op write checks.
+              --probe [file]        hardware readings and current settings; no tuning writes.
+              --intel-audit [file]  per-thread Intel register and mailbox readings.
+              --asus-audit         ASUS control metadata and measured clocks; no tuning writes.
+              --windows-audit      read this boot's restricted-MSR events; no hardware access.
+              --ring-validate      briefly lower the ring ceiling, check live clock, restore.
+              --ecore-validate N   test E-core ratio (up to 44 and one step above current), restore.
+              --intel-validate V   temporary lower P-core ceiling and voltage-target check;
+                                   closes no apps, requires one instance, restores snapshots.
                                     Attach this when reporting a board that misbehaves.
               --help                this list.
 
             Checking a control that seems to do nothing
+              --asus-voltage-validate  test ASUS Manual SVID at 1.275/1.300 V, then restore.
+              --asus-bclk-validate     test nominal 101 MHz in measured steps, then restore.
+              --asus-rail-validate sa|l2 volts  test the selected ASUS voltage and sensor response, then restore.
+              --asus-ring-voltage-validate    test Cache SVID at 1.300 V, verify CPU target, then restore.
               --vtest [file]        nudge core voltage and ring ratio, confirm the CPU follows, restore.
               --vcore-test [file]   raise the core voltage request, measure the rail the VRM produces,
                                     and say plainly whether the board follows the CPU.
@@ -713,16 +756,7 @@ internal static class Program
                 var live = hw.ReadLive(); Thread.Sleep(500); live = hw.ReadLive();
                 W($"Live         : {live.PackageTempC} C, x{live.CoreRatio} = {live.CoreMHz:0.0} MHz, VID {live.CoreVid:0.000} V, ring x{live.RingRatio}, {live.PackageWatts:0.0} W");
 
-                // No-op write tests (rewrite the exact current values) to prove the write paths are accepted.
-                W("");
-                W("Write-path checks (no-op rewrites of current values):");
-                try { cpu.WritePCoreTurboTable(pr); W("  MSR 0x1AD rewrite      : OK"); } catch (Exception ex) { W("  MSR 0x1AD rewrite      : " + ex.Message); }
-                try { cpu.WriteRingRatio(ring.max); W("  MSR 0x620 rewrite      : OK"); } catch (Exception ex) { W("  MSR 0x620 rewrite      : " + ex.Message); }
-                if (hw.MailboxAvailable)
-                {
-                    try { var s = cpu.Mailbox.ReadDomain(0); cpu.Mailbox.WriteDomain(0, s); W("  Mailbox dom 0 rewrite  : OK"); }
-                    catch (Exception ex) { W("  Mailbox dom 0 rewrite  : " + ex.Message); }
-                }
+                W("Readback alone does not establish that a setting reached the hardware. Use controlled validation for that.");
             }
             if (hw.Amd is { } amd)
             {

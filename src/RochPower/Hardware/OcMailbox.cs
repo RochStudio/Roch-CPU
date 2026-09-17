@@ -56,7 +56,9 @@ public sealed class OcMailbox
             ulong v = (1UL << 63) | ((ulong)command << 32) | ((ulong)param1 << 40) | ((ulong)param2 << 48) | data;
             if (!_drv.WriteMsr(MSR_OC_MAILBOX, v, _cpu)) throw new IOException("OC mailbox write failed (MSR 0x150 not accepted; mailbox disabled or CPU not supported).");
             if (!WaitNotBusy()) throw new TimeoutException("OC mailbox did not complete.");
-            _drv.ReadMsr(MSR_OC_MAILBOX, out ulong r, _cpu);
+            if (!_drv.ReadMsr(MSR_OC_MAILBOX, out ulong r, _cpu))
+                throw new IOException("OC mailbox response could not be read; the command is not verified.");
+            if ((r >> 63) != 0) throw new IOException("OC mailbox response changed during the transaction; try again with other tuning tools closed.");
             result = (uint)r;
             return (byte)((r >> 32) & 0xFF);
         }
@@ -125,27 +127,56 @@ public sealed class OcMailbox
 
     public void WriteDomain(int domain, VfDomainSettings s)
     {
-        byte st = Execute(CMD_WRITE_VF, (byte)domain, 0, Encode(s), out _);
-        if (st != 0) throw new IOException($"Mailbox write to domain {domain} rejected: {DescribeStatus(st)}.");
+        lock (_lock)
+        {
+            uint before = Encode(ReadDomain(domain));
+            uint requested = Encode(s);
+            try
+            {
+                byte st = Execute(CMD_WRITE_VF, (byte)domain, 0, requested, out _);
+                if (st != 0) throw new IOException($"Mailbox write to domain {domain} rejected: {DescribeStatus(st)}.");
+                uint actual = Encode(ReadDomain(domain));
+                if (actual != requested)
+                    throw new IOException($"Mailbox domain {domain} did not retain the request (requested 0x{requested:X8}, read back 0x{actual:X8}). BIOS restrictions or a hypervisor may be filtering writes.");
+            }
+            catch (Exception ex)
+            {
+                string restore;
+                try
+                {
+                    byte restoreStatus = Execute(CMD_WRITE_VF, (byte)domain, 0, before, out _);
+                    restore = restoreStatus == 0 && Encode(ReadDomain(domain)) == before
+                        ? "Previous mailbox value restored and read back." : "Previous mailbox value could not be verified after restore.";
+                }
+                catch (Exception restoreError) { restore = "Restore failed: " + restoreError.Message; }
+                throw new IOException(ex.Message + " " + restore, ex);
+            }
+        }
     }
 
     /// <summary>Sets an adaptive-mode voltage offset, keeping the domain ratio.</summary>
     public void SetOffset(int domain, double offsetVolts)
     {
-        var s = ReadDomain(domain);
-        s.OverrideMode = false;
-        s.TargetVolts = 0;
-        s.OffsetVolts = offsetVolts;
-        WriteDomain(domain, s);
+        lock (_lock)
+        {
+            var s = ReadDomain(domain);
+            s.OverrideMode = false;
+            s.TargetVolts = 0;
+            s.OffsetVolts = offsetVolts;
+            WriteDomain(domain, s);
+        }
     }
 
     /// <summary>Sets a static override voltage (volts). 0 restores adaptive mode.</summary>
     public void SetOverride(int domain, double volts)
     {
-        var s = ReadDomain(domain);
-        if (volts <= 0) { s.OverrideMode = false; s.TargetVolts = 0; }
-        else { s.OverrideMode = true; s.TargetVolts = volts; }
-        WriteDomain(domain, s);
+        lock (_lock)
+        {
+            var s = ReadDomain(domain);
+            if (volts <= 0) { s.OverrideMode = false; s.TargetVolts = 0; }
+            else { s.OverrideMode = true; s.TargetVolts = volts; }
+            WriteDomain(domain, s);
+        }
     }
 
     /// <summary>IccMax for a domain in amperes (mailbox 0x16, 1/4 A units).</summary>
