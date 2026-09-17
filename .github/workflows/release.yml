@@ -1,0 +1,88 @@
+name: Publish release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing draft release tag (vX.Y.Z)
+        required: true
+        type: string
+      commit_sha:
+        description: Full source commit matching the draft release
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      SOURCE_SHA: ${{ inputs.commit_sha }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Validate release inputs
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$') { throw 'Expected vX.Y.Z tag' }
+          if ($env:SOURCE_SHA -notmatch '^[0-9a-f]{40}$') { throw 'Expected full commit SHA' }
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Regression checks
+        run: dotnet run --project tests/RochPower.Tests/RochPower.Tests.csproj -c Release
+
+      - name: Build self-contained Windows package
+        run: dotnet publish src/RochPower/RochPower.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o package
+
+      - name: Package and verify
+        shell: pwsh
+        run: |
+          $version = $env:RELEASE_TAG.Substring(1)
+          $info = (Get-Item -LiteralPath 'package/Roch CPU.exe').VersionInfo
+          if ($info.FileVersion -ne "$version.0" -or $info.ProductVersion -ne "$version+$env:SOURCE_SHA") { throw 'Binary version or revision mismatch' }
+          $driverHash = (Get-FileHash -LiteralPath 'package/WinRing0x64.sys').Hash
+          if ($driverHash -ne '11BD2C9F9E2397C9A16E0990E4ED2CF0679498FE0FD418A3DFDAC60B5C160EE5') { throw 'Driver hash mismatch' }
+          $moduleHash = (Get-FileHash -LiteralPath 'package/pawnio/RyzenSMU.bin').Hash
+          if ($moduleHash -ne 'B84ECA7F32C63B3D8C14B2C6D45482706DF8683AA6F43EB8BEAD9DC62181D38F') { throw 'PawnIO module hash mismatch' }
+          Copy-Item -LiteralPath 'LICENSE','THIRD-PARTY-NOTICES.md' -Destination package
+          Copy-Item -LiteralPath docs -Destination package -Recurse
+          $files = Get-ChildItem -LiteralPath package | Where-Object Name -NE 'Roch CPU.pdb'
+          $zipName = "Roch-CPU-$version-win-x64.zip"
+          Compress-Archive -LiteralPath $files.FullName -DestinationPath $zipName -CompressionLevel Optimal
+          $hash = (Get-FileHash -LiteralPath $zipName).Hash.ToLowerInvariant()
+          "$hash  $zipName" | Set-Content -LiteralPath SHA256SUMS.txt -Encoding ascii
+
+      - name: Upload, verify and publish existing draft
+        shell: pwsh
+        run: |
+          $api = "repos/$env:GITHUB_REPOSITORY"
+          $releases = gh api "$api/releases?per_page=100" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read release metadata' }
+          $release = $releases | Where-Object tag_name -EQ $env:RELEASE_TAG
+          if (!$release -or !$release.draft -or $release.target_commitish -ne $env:SOURCE_SHA) { throw 'Expected matching draft release' }
+          $zipName = "Roch-CPU-$($env:RELEASE_TAG.Substring(1))-win-x64.zip"
+          gh release upload $env:RELEASE_TAG $zipName SHA256SUMS.txt --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Upload failed; release remains a draft' }
+          $assets = gh api "$api/releases/$($release.id)/assets" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Could not verify uploaded assets' }
+          foreach ($name in @($zipName, 'SHA256SUMS.txt')) {
+            $asset = $assets | Where-Object name -EQ $name
+            $expected = 'sha256:' + (Get-FileHash -LiteralPath $name).Hash.ToLowerInvariant()
+            if (!$asset -or $asset.state -ne 'uploaded' -or $asset.digest -ne $expected -or $asset.size -ne (Get-Item -LiteralPath $name).Length) { throw "Asset verification failed: $name" }
+          }
+          gh release edit $env:RELEASE_TAG --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Publication failed' }
