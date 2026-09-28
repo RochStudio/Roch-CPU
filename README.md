@@ -15,13 +15,13 @@ Windows 10/11 x64 is required. If Windows blocks a driver, some controls will be
 ## Features
 
 - **Intel tuning:** supported core, E-core and ring ratios, voltage offsets/overrides, and PL1/PL2 power limits. BIOS locks and CPU/chipset restrictions still apply.
-- **AMD Ryzen tuning:** PPT, TDC, EDC, thermal limit, PBO scalar and supported FMax controls through the SMU.
+- **AMD Ryzen tuning:** PPT, TDC, EDC, thermal limit, PBO scalar and supported FMax controls through the SMU. With PawnIO installed, each limit row also shows the live draw (watts, amps, temperature); without it the app says so and links to pawnio.eu.
 - **Per-core Curve Optimizer:** edit individual AMD core offsets, refresh hardware readings and apply changes from a dedicated window.
 - **DDR5 memory voltages:** per-DIMM VDD, VDDQ and VPP controls where the PMIC permits writes, with calibration and read-back checks.
 - **Board-specific controls:** CPU Core override, base clock and CPU VDD2 on supported MSI Intel 600/700-series boards. Core override updates both the Renesas regulator and Intel OC mailbox, with read-back and rail verification. AMD BCLK writing is not enabled on the tested B850MPOWER.
-- **Light and dark modes:** grouped clock, power, boost and memory sections, editable values and a log explaining rejected or unavailable settings.
+- **Light and dark modes:** light by default, switched with the sun/moon button beside minimize. Grouped clock, power, boost and memory sections in a compact window, allowed ranges in each row's tooltip, and a log explaining rejected or unavailable settings.
 - **Social links:** YouTube | X | Discord in the bottom-left footer, matching Roch Viewer.
-- **Hardware-read header:** CPU, core/thread topology, microcode, motherboard and BIOS values are labeled consistently above the controls.
+- **Hardware-read header:** CPU, core/thread topology, microcode, motherboard, AGESA (AMD) and BIOS values are labeled consistently above the controls. On AMD the Base Clock row shows the measured BCLK (read-only).
 - **Intel voltage read-back:** programmed Core, E-core L2, Ring, SA and GT targets are shown when firmware supplies them. On supported MSI boards, Core displays the regulator target rather than a potentially stale mailbox-only value; an adaptive Ring with no encoded target displays the real shared IA/core-rail voltage instead of `Auto`.
 - **Apply and Reset:** Apply writes your edits; Reset restores the tool's startup baseline where supported.
 
@@ -44,7 +44,7 @@ Install the **.NET 10 SDK**, then run:
 build.cmd --self-contained
 ```
 
-Open `dist\Roch CPU.exe`. The current version is **1.0.4**.
+Open `dist\Roch CPU.exe`. The current version is **1.0.5**.
 
 ### Intel write verification
 

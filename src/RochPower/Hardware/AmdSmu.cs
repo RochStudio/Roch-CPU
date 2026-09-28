@@ -596,6 +596,7 @@ public sealed class AmdSmu : IDisposable
     public float? EdcLimit => Layout is { } l ? Limit("edc", l.EdcLimit) : null;
     public float? EdcValue => Layout is { } l ? Field(l.EdcValue) : null;
     public float? ThmLimit => Layout is { } l ? Limit("tctl", l.ThmLimit) : null;
+    public float? ThmValue => Layout is { } l ? Field(l.ThmValue) : null;
     public float? SocketPower => Layout is { } l ? Field(l.SocketPower) : null;
 
     /// <summary>

@@ -16,6 +16,8 @@ public sealed class Setting
     public int Decimals { get; init; }
     /// <summary>Reads the current setting; null means "Auto"/not set.</summary>
     public Func<double?> Read { get; init; } = () => null;
+    /// <summary>What the hardware is doing right now against this limit (draw, current, temperature). Null: nothing to show.</summary>
+    public Func<double?>? Live { get; init; }
     /// <summary>Applies a value. Null makes the row read-only.</summary>
     public Action<double>? Write { get; init; }
     /// <summary>Called when the user enters 0 (restore default). Null: write DefaultValue.</summary>

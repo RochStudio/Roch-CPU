@@ -14,6 +14,8 @@ public sealed class SmbiosInfo
     public string BoardManufacturer { get; private set; } = "";
     public string BoardProduct { get; private set; } = "";
     public string BoardVersion { get; private set; } = "";
+    /// <summary>AMD firmware version, e.g. "ComboAm5PI 1.2.0.3e Patch A". Empty on Intel.</summary>
+    public string Agesa { get; private set; } = "";
 
     public string MainboardModel =>
         string.IsNullOrWhiteSpace(BoardProduct) ? $"{SystemManufacturer} {SystemProduct}".Trim() : $"{BoardManufacturer} {BoardProduct}".Trim();
@@ -35,7 +37,9 @@ public sealed class SmbiosInfo
             {
                 int s = p;
                 while (p < end && raw[p] != 0) p++;
-                if (p == s) { p++; break; } // double zero terminator (or no strings at all)
+                // A structure with no strings still ends in two zeros; skipping only one left the walk
+                // on the second, read as a zero-length header, and it stopped before type 40.
+                if (p == s) { p += 2; break; }
                 strings.Add(Encoding.ASCII.GetString(raw, s, p - s));
                 p++;
                 if (p < end && raw[p] == 0) { p++; break; }
@@ -59,6 +63,12 @@ public sealed class SmbiosInfo
                     info.BoardManufacturer = Str(raw[pos + 4]);
                     info.BoardProduct = Str(raw[pos + 5]);
                     info.BoardVersion = Str(raw[pos + 6]);
+                    break;
+                // Type 40, Additional Information: AMD firmware lists "AGESA!V9 ComboAm5PI 1.2.0.3e Patch A"
+                // among its strings, the same entry Linux prints at boot.
+                case 40 when info.Agesa == "":
+                    if (strings.FirstOrDefault(x => x.StartsWith("AGESA", StringComparison.Ordinal)) is { } agesa)
+                        info.Agesa = System.Text.RegularExpressions.Regex.Replace(agesa, @"^AGESA!?(V\d+)?\s*", "").Trim();
                     break;
                 case 127:
                     return info;

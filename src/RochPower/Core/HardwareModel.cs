@@ -510,7 +510,11 @@ public sealed class HardwareModel : IDisposable
                 if (!control.Restore()) throw new InvalidOperationException(control.Status);
                 MeasureBclk();
             },
-            Note = AsusControl != null && control == null
+            Note = IsAmd
+                ? "Measured base clock: the time-stamp counter, which Ryzen runs at base clock x the P0 multiplier, " +
+                  "timed against the ACPI timer, which does not move with base clock. Read-only: no Windows write path " +
+                  "to the board's clock generator has been verified on AM5."
+                : AsusControl != null && control == null
                 ? "Measured physical BCLK. The ASUS scalar target read back during testing, but the physical clock did not move. Live writes remain unavailable until a working clock-generator interface is verified."
                 : control == null
                 ? "Real core clocks counted against the ACPI timer, so it tracks a BCLK change made anywhere - including " +
@@ -582,11 +586,16 @@ public sealed class HardwareModel : IDisposable
             ? " Read back from the SMU power table through PawnIO."
             : " The SMU has no message that reports the limit in force and, without PawnIO, its power table cannot be read, so the row starts as Auto (whatever the BIOS set) and then shows what was written here.";
         Action? Stock(string id, double? stock, Action<double> write) => stock is double v ? () => { write(v); _lastWritten[id] = v; } : null;
+        // What the CPU is drawing against each limit; only where the table itself can be read.
+        Func<double?>? Now(Func<float?> field) => live && smu.TableReadable && smu.Layout != null
+            ? () => TableFresh() && field() is float f && f >= 0 ? f : null
+            : null;
         string StockNote(double? v, string unit) => v is double d ? $" Entering 0 writes the CPU's stock value ({d:0} {unit}); the BIOS value itself only comes back with a reboot." : "";
         Settings.Add(new Setting
         {
             Id = "ppt", Name = "PPT (Package Power Tracking)", Group = SettingGroup.Power, Unit = "W", Min = 5, Max = 2000, Decimals = 0,
             Read = () => live ? Limit("ppt", () => smu.PptLimit) : null,
+            Live = Now(() => smu.PptValue),
             Write = live && msgs.HasPowerLimits ? v => WriteLimit("ppt", "PPT", smu.SetPpt, () => smu.PptLimit, v) : null,
             RestoreDefault = live ? Stock("ppt", StockLimits.ppt, smu.SetPpt) : null,
             Note = "Total socket power the boost algorithm may use, in watts (SMU message SetPPTLimit)." + tableNote + StockNote(StockLimits.ppt, "W") + pboNote,
@@ -596,6 +605,7 @@ public sealed class HardwareModel : IDisposable
         {
             Id = "tdc", Name = "TDC (Thermal Design Current)", Group = SettingGroup.Power, Unit = "A", Min = 5, Max = 2000, Decimals = 0,
             Read = () => live ? Limit("tdc", () => smu.TdcLimit) : null,
+            Live = Now(() => smu.TdcValue),
             Write = live && msgs.HasCurrentLimits ? v => WriteLimit("tdc", "TDC", smu.SetTdc, () => smu.TdcLimit, v) : null,
             RestoreDefault = live ? Stock("tdc", StockLimits.tdc, smu.SetTdc) : null,
             Note = "Sustained current the VRM may deliver on the core rail, in amperes, thermally limited (SetTDCVDDLimit)." + tableNote + StockNote(StockLimits.tdc, "A") + pboNote,
@@ -605,6 +615,7 @@ public sealed class HardwareModel : IDisposable
         {
             Id = "edc", Name = "EDC (Electrical Design Current)", Group = SettingGroup.Power, Unit = "A", Min = 5, Max = 2000, Decimals = 0,
             Read = () => live ? Limit("edc", () => smu.EdcLimit) : null,
+            Live = Now(() => smu.EdcValue),
             Write = live && msgs.HasCurrentLimits ? v => WriteLimit("edc", "EDC", smu.SetEdc, () => smu.EdcLimit, v) : null,
             RestoreDefault = live ? Stock("edc", StockLimits.edc, smu.SetEdc) : null,
             Note = "Peak current the VRM may deliver on the core rail, in amperes (SetEDCVDDLimit)." + tableNote + StockNote(StockLimits.edc, "A") + pboNote,
@@ -614,6 +625,7 @@ public sealed class HardwareModel : IDisposable
         {
             Id = "tctl", Name = "Thermal Limit (Tctl max)", Group = SettingGroup.Power, Unit = "C", Min = 50, Max = 115, Decimals = 0,
             Read = () => live ? Limit("tctl", () => smu.ThmLimit) : null,
+            Live = Now(() => smu.ThmValue),
             Write = live && msgs.RsmuSetTctlMax != 0 ? v => WriteLimit("tctl", "Tctl max", smu.SetTctlMax, () => smu.ThmLimit, v) : null,
             Note = "Temperature the boost algorithm holds the CPU to, in degrees C (SetTctlMax). Lower it to trade a little clock for a quieter, cooler CPU." + tableNote,
             Available = live && msgs.RsmuSetTctlMax != 0
@@ -1020,6 +1032,9 @@ public sealed class HardwareModel : IDisposable
         if (Bclk is not { IsAvailable: true } || BaseRatio == 0) return null;
         try
         {
+            // Ryzen's TSC ticks at base clock x the P0 multiplier. The cycle-counter method below
+            // reads Intel-only MSRs, so it is not tried there.
+            if (IsAmd) { LastBclk = Bclk.MeasureBclkMHz(BaseRatio); return LastBclk; }
             int core = Cpu?.FirstPThread ?? 0;
             LastBclk = Bclk.MeasureBclkFromCycles(core) ?? Bclk.MeasureBclkMHz(BaseRatio);
             return LastBclk;

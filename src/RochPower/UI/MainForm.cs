@@ -7,7 +7,7 @@ namespace RochPower.UI;
 public sealed class MainForm : Form
 {
     public const string AppName = "Roch CPU";
-    public const string AppVersion = "1.0.4";
+    public const string AppVersion = "1.0.5";
     private const int ResizeBorder = 6;
 
     private readonly HardwareModel _hw = new();
@@ -18,12 +18,13 @@ public sealed class MainForm : Form
     private readonly Label _lblCores = Theme.Muted_("");
     private readonly Label _lblMicrocode = Theme.Muted_("");
     private readonly Label _lblBoard = Theme.Muted_("");
+    private readonly Label _lblAgesa = Theme.Muted_("");
     private readonly Label _lblBios = Theme.Muted_("");
     private readonly Label _lblLive = Theme.Muted_("");
     private readonly ToolTip _resultTip = new() { AutoPopDelay = 30000 };
     private readonly Label _lblWarn = Theme.Label("", Theme.Small, Theme.Warn);
     private readonly Button _btnLog = Theme.Button("Log");
-    private readonly Button _btnTheme = Theme.Button(Theme.IsDark ? "Light" : "Dark");
+    private readonly Button _btnTheme = Theme.TitleButton(Theme.GlyphTheme);
     private readonly Button _btnPerCore = Theme.Button("Per-Core Ratio Table");
     private readonly Button _btnAuto = Theme.Button("Start");
     private TextBox _txtAutoStep = null!, _txtAutoInterval = null!;
@@ -35,6 +36,8 @@ public sealed class MainForm : Form
     private readonly Dictionary<Setting, TextBox> _boxes = new();
     private readonly Dictionary<Setting, Label> _statusLabels = new();
     private readonly Dictionary<Setting, Label> _rangeLabels = new();
+    /// <summary>When each row last showed an apply result in its range label, so the live reading leaves it up for a while.</summary>
+    private readonly Dictionary<Setting, DateTime> _rowResults = new();
     private Label? _coreVoltageComparison;
 
     private readonly Button _btnApply = Theme.Button("Apply", primary: true);
@@ -56,8 +59,8 @@ public sealed class MainForm : Form
         ForeColor = Theme.Text;
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.CenterScreen;
-        MinimumSize = new Size(600, 420);
-        Size = new Size(660, 800);
+        MinimumSize = new Size(480, 400);
+        Size = new Size(500, 760);
         KeyPreview = true;
         DoubleBuffered = true;
 
@@ -92,15 +95,23 @@ public sealed class MainForm : Form
         var btnMin = Theme.TitleButton(Theme.GlyphMinimise);
         btnClose.Click += (_, _) => Close();
         btnMin.Click += (_, _) => WindowState = FormWindowState.Minimized;
-        var tb = new FlowLayoutPanel { FlowDirection = FlowDirection.RightToLeft, Dock = DockStyle.Right, Width = 88, BackColor = Color.Transparent, Margin = new Padding(0) };
-        tb.Controls.Add(btnClose); tb.Controls.Add(btnMin);
+        _btnTheme.Click += (_, _) =>
+        {
+            try { Theme.Toggle(this, _logForm); }
+            catch (Exception ex) { AppendLog("Theme preference could not be saved: " + ex.Message); }
+            _btnTheme.Text = Theme.GlyphTheme;
+            _resultTip.SetToolTip(_btnTheme, ThemeTip());
+        };
+        _resultTip.SetToolTip(_btnTheme, ThemeTip());
+        var tb = new FlowLayoutPanel { FlowDirection = FlowDirection.RightToLeft, Dock = DockStyle.Right, Width = 132, BackColor = Color.Transparent, Margin = new Padding(0) };
+        tb.Controls.Add(btnClose); tb.Controls.Add(btnMin); tb.Controls.Add(_btnTheme);
         title.Controls.Add(tb);
         foreach (Control c in new Control[] { title, brand, roch, cpu }) Theme.EnableDrag(c, this);
         foreach (Control c in brand.Controls) Theme.EnableDrag(c, this);
         outer.Controls.Add(title, 0, 0);
 
         // ---- body ----
-        _body = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, BackColor = Theme.Bg, Padding = new Padding(12, 4, 12, 8), Margin = new Padding(0) };
+        _body = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, BackColor = Theme.Bg, Padding = new Padding(10, 2, 10, 6), Margin = new Padding(0) };
         _body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         _body.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // header
         _body.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // tools
@@ -118,35 +129,29 @@ public sealed class MainForm : Form
         header.Controls.Add(_lblCpu, 0, 0);
         var headerButtons = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, Margin = new Padding(0) };
         _btnLog.Width = 64;
-        _btnTheme.Font = Theme.Small; _btnTheme.AutoSize = false; _btnTheme.Size = new Size(64, 24); _btnTheme.Padding = new Padding(0); _btnTheme.Margin = new Padding(6, 2, 0, 0);
-        _btnTheme.Click += (_, _) =>
-        {
-            try { Theme.Toggle(this, _logForm); }
-            catch (Exception ex) { AppendLog("Theme preference could not be saved: " + ex.Message); }
-            _btnTheme.Text = Theme.IsDark ? "Light" : "Dark";
-        };
         headerButtons.Controls.Add(_btnLog);
-        headerButtons.Controls.Add(_btnTheme);
         header.Controls.Add(headerButtons, 1, 0);
         header.SetRowSpan(headerButtons, 2);
-        _lblCores.Margin = new Padding(0, 2, 0, 0);
-        _lblMicrocode.Margin = new Padding(0, 2, 0, 0);
-        _lblBoard.Margin = new Padding(0, 2, 0, 0);
-        _lblBios.Margin = new Padding(0, 2, 0, 0);
+        _lblCores.Margin = new Padding(0, 1, 0, 0);
+        _lblMicrocode.Margin = new Padding(0, 1, 0, 0);
+        _lblBoard.Margin = new Padding(0, 1, 0, 0);
+        _lblAgesa.Margin = new Padding(0, 1, 0, 0);
+        _lblBios.Margin = new Padding(0, 1, 0, 0);
         _lblWarn.Margin = new Padding(0, 4, 0, 0);
         header.Controls.Add(_lblCores, 0, 1);
         header.Controls.Add(_lblMicrocode, 0, 2);
         header.Controls.Add(_lblBoard, 0, 3);
-        header.Controls.Add(_lblBios, 0, 4);
-        header.Controls.Add(_lblLive, 0, 5);
+        header.Controls.Add(_lblAgesa, 0, 4);
+        header.Controls.Add(_lblBios, 0, 5);
+        header.Controls.Add(_lblLive, 0, 6);
         header.SetColumnSpan(_lblLive, 2);
-        header.Controls.Add(_lblWarn, 0, 6);
-        _lblWarn.MaximumSize = new Size(620, 0);
+        header.Controls.Add(_lblWarn, 0, 7);
+        _lblWarn.MaximumSize = new Size(460, 0);
         header.SetColumnSpan(_lblWarn, 2);
         _body.Controls.Add(header, 0, 0);
 
         // tools: per-core table + auto ratio stepper
-        var toolRow = _toolRow = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = false, Height = 72, ColumnCount = 1, RowCount = 2, BackColor = Theme.Bg, Margin = new Padding(0, 8, 0, 4) };
+        var toolRow = _toolRow = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = false, Height = 72, ColumnCount = 1, RowCount = 2, BackColor = Theme.Bg, Margin = new Padding(0, 4, 0, 2) };
         toolRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         toolRow.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
         toolRow.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
@@ -168,17 +173,17 @@ public sealed class MainForm : Form
 
         // rows: no scroller, the window is sized to hold them
         _rows.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        _rows.Margin = new Padding(0, 6, 0, 0);
+        _rows.Margin = new Padding(0, 2, 0, 0);
         _body.Controls.Add(_rows, 0, 2);
 
         // Apply / reset. Refresh-from-hardware remains automatic for live read-only rows.
-        var applyRow = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 2, BackColor = Theme.Bg, Margin = new Padding(0, 8, 0, 0) };
+        var applyRow = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 2, BackColor = Theme.Bg, Margin = new Padding(0, 4, 0, 0) };
         applyRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
         applyRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
         _btnApply.Dock = DockStyle.Fill; _btnApply.AutoSize = false; _btnApply.Height = 32; _btnApply.Margin = new Padding(0, 0, 6, 0);
         _btnReset.Height = 32; _btnReset.AutoSize = false; _btnReset.Width = 72; _btnReset.Padding = new Padding(0); _btnReset.Margin = new Padding(0);
         _btnReset.Dock = DockStyle.Fill;
-        _btnApply.Height = _btnReset.Height = 38;
+        _btnApply.Height = _btnReset.Height = 32;
         _btnApply.Click += (_, _) => ApplyAll();
         _btnReset.Click += (_, _) => RestoreDefaults();
         applyRow.Controls.Add(_btnApply, 0, 0);
@@ -186,11 +191,15 @@ public sealed class MainForm : Form
         _body.Controls.Add(applyRow, 0, 3);
 
         // status
-        var status = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 2, BackColor = Theme.Bg, Margin = new Padding(0, 6, 0, 0) };
-        status.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        status.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        // A plain top-down stack: the two-column table this used to be reserved a blank line under the links.
+        var status = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, FlowDirection = FlowDirection.TopDown,
+            WrapContents = false, BackColor = Theme.Bg, Margin = new Padding(0, 6, 0, 0)
+        };
         _lblStatus.AutoSize = true;
-        status.Controls.Add(_lblStatus, 0, 0);
+        _lblStatus.Margin = new Padding(0);
+        status.Controls.Add(_lblStatus);
         // Roch Viewer's footer handle: brand red, bold, no underline, and colour is the whole
         // affordance - there is no button edge, so it lifts a shade under the pointer.
         var author = new LinkLabel
@@ -206,16 +215,14 @@ public sealed class MainForm : Form
         author.LinkClicked += (_, e) => { try { if (e.Link?.LinkData is string url) System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(url) { UseShellExecute = true }); } catch { } };
         author.MouseEnter += (_, _) => author.LinkColor = Theme.Warn;
         author.MouseLeave += (_, _) => author.LinkColor = Theme.Accent;
-        status.Controls.Add(author, 0, 1);
-        status.SetColumnSpan(_lblStatus, 2);
-        status.SetColumnSpan(author, 2);
+        status.Controls.Add(author);
         _body.Controls.Add(status, 0, 4);
 
         Resize += (_, _) =>
         {
             int w = Math.Max(240, ClientSize.Width - 90);
             _lblStatus.MaximumSize = new Size(w, 0);
-            foreach (var l in new[] { _lblCpu, _lblCores, _lblMicrocode, _lblBoard, _lblBios, _lblWarn }) l.MaximumSize = new Size(ClientSize.Width - 80, 0);
+            foreach (var l in new[] { _lblCpu, _lblCores, _lblMicrocode, _lblBoard, _lblAgesa, _lblBios, _lblWarn }) l.MaximumSize = new Size(ClientSize.Width - 80, 0);
         };
     }
 
@@ -226,7 +233,7 @@ public sealed class MainForm : Form
         foreach (Control old in _rows.Controls.Cast<Control>().ToArray()) old.Dispose();
         _rows.Controls.Clear();
         _rows.RowStyles.Clear();
-        _boxes.Clear(); _statusLabels.Clear(); _rangeLabels.Clear();
+        _boxes.Clear(); _statusLabels.Clear(); _rangeLabels.Clear(); _rowResults.Clear();
         _coreVoltageComparison = null;
         SettingGroup? last = null;
         TableLayoutPanel? section = null;
@@ -243,7 +250,7 @@ public sealed class MainForm : Form
                 {
                     AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
                     ColumnCount = 1, Dock = DockStyle.Top, BackColor = Theme.Bg,
-                    Padding = new Padding(10, 5, 10, 6), Margin = new Padding(0, 0, 0, 8)
+                    Padding = new Padding(10, 3, 10, 4), Margin = new Padding(0, 0, 0, 6)
                 };
                 section.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
                 section.Paint += (_, e) =>
@@ -260,16 +267,17 @@ public sealed class MainForm : Form
                     SettingGroup.Memory => "Memory",
                     SettingGroup.Board => "Board VRM rails (measured)", _ => ""
                 });
-                heading.Margin = new Padding(0, 0, 0, 4);
+                heading.Margin = new Padding(0, 0, 0, 2);
                 section.Controls.Add(heading);
                 section.Controls.Add(Theme.Rule());
+                if (s.Group == SettingGroup.Power && _hw.IsAmd && !PawnIo.IsInstalled) section.Controls.Add(PawnIoNote());
                 _rows.Controls.Add(section);
             }
 
             // Alternating row shading, the way Roch Viewer's tables read.
             var rowBack = Theme.Bg;
             var row = new TableLayoutPanel { AutoSize = true, ColumnCount = 4, Dock = DockStyle.Top, BackColor = rowBack, Margin = new Padding(0) };
-            row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 225));
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 180));
             row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 84));
             row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 40));
             row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -279,24 +287,24 @@ public sealed class MainForm : Form
                 .Replace(" (all cores)", "").Replace("DRAM ", "").Replace(" Voltage", "");
             var name = Theme.Label(displayName, Theme.Row, Theme.Text);
             if (s.Group == SettingGroup.Memory && !displayName.Contains("VDDQ") && !displayName.Contains("VPP")) name.Text += " VDD";
-            name.MaximumSize = new Size(220, 0);
-            name.Margin = new Padding(6, 5, 0, 5);
-            var range = Theme.Muted_(s.ReadOnly ? "read-only" : s.RangeText);
-            range.Margin = new Padding(8, 6, 8, 0);
+            name.MaximumSize = new Size(175, 0);
+            name.Margin = new Padding(6, 4, 0, 3);
+            var range = Theme.Muted_(IdleText(s));
+            range.Margin = new Padding(8, 5, 8, 0);
             range.TextAlign = ContentAlignment.MiddleRight;
             var frame = Theme.ValueBox(out var box, 76);
             frame.Margin = new Padding(0, 1, 0, 1);
             box.Text = s.CurrentText;
             box.Enabled = !s.ReadOnly;
             box.Tag = s;
-            var unit = Theme.Muted_(s.Unit); unit.Margin = new Padding(4, 6, 0, 0); unit.Width = 34; unit.AutoSize = false;
+            var unit = Theme.Muted_(s.Unit); unit.Margin = new Padding(4, 5, 0, 0); unit.Width = 34; unit.AutoSize = false;
 
             row.Controls.Add(name, 0, 0);
             row.Controls.Add(frame, 1, 0);
             row.Controls.Add(unit, 2, 0);
             range.Dock = DockStyle.Fill; range.AutoSize = false; range.AutoEllipsis = true;
             row.Controls.Add(range, 3, 0);
-            if (s.Note != null) { var tip = new ToolTip { AutoPopDelay = 20000 }; tip.SetToolTip(name, s.Note); tip.SetToolTip(box, s.Note); tip.SetToolTip(range, s.Note); }
+            if (RowTip(s) is { } tipText) { var tip = new ToolTip { AutoPopDelay = 20000 }; tip.SetToolTip(name, tipText); tip.SetToolTip(box, tipText); tip.SetToolTip(range, tipText); }
             section!.Controls.Add(row);
             if (s.Id == "core_v" && _hw.AsusControl != null)
             {
@@ -313,11 +321,39 @@ public sealed class MainForm : Form
         _rows.ResumeLayout();
     }
 
+    /// <summary>The right-hand column when there is no live reading or apply result to show.</summary>
+    private static string IdleText(Setting s) => s.ReadOnly ? "read-only" : "";
+
+    /// <summary>Hover text for a row: its allowed range first, then what the setting does.</summary>
+    private static string? RowTip(Setting s)
+    {
+        string? range = s.ReadOnly ? null : "Range: " + s.RangeText.Replace("Min:", "").Replace(", Max:", " to ");
+        return range == null ? s.Note : s.Note == null ? range : range + "\n\n" + s.Note;
+    }
+
+    private static string ThemeTip() => Theme.IsDark ? "Switch to light mode" : "Switch to dark mode";
+
+    /// <summary>Without PawnIO the SMU power table cannot be read, so the AMD limit rows start as Auto.</summary>
+    private static LinkLabel PawnIoNote()
+    {
+        const string site = "pawnio.eu";
+        var note = new LinkLabel
+        {
+            Text = $"PPT, TDC, EDC and Thermal Limit show Auto because PawnIO is not installed. Install it from {site}, then restart Roch CPU to see the values set in the BIOS.",
+            Font = Theme.Small, ForeColor = Theme.Warn, LinkColor = Theme.Accent, ActiveLinkColor = Theme.Warn, VisitedLinkColor = Theme.Accent,
+            BackColor = Color.Transparent, AutoSize = true, MaximumSize = new Size(440, 0), Margin = new Padding(6, 2, 6, 6)
+        };
+        note.Links.Clear();
+        note.Links.Add(note.Text.IndexOf(site, StringComparison.Ordinal), site.Length, "https://pawnio.eu");
+        note.LinkClicked += (_, e) => { try { if (e.Link?.LinkData is string url) System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(url) { UseShellExecute = true }); } catch { } };
+        return note;
+    }
+
     /// <summary>Grow the window to whatever the rows need, so there is never a scrollbar.</summary>
     private void FitToContent()
     {
         _body.PerformLayout();
-        int needed = _body.PreferredSize.Height + 30 /* title bar */ + 12;
+        int needed = _body.PreferredSize.Height + 30 /* title bar */ + 2 /* 1 px border */;
         var work = Screen.FromControl(this).WorkingArea;
         int height = Math.Min(needed, work.Height - 40);
         Height = Math.Max(MinimumSize.Height, height);
@@ -372,6 +408,8 @@ public sealed class MainForm : Form
             _lblMicrocode.Text = "Microcode: Unknown";
         }
         _lblBoard.Text = $"Motherboard: {(string.IsNullOrWhiteSpace(sm.BoardProduct) ? sm.SystemProduct : sm.BoardProduct)}";
+        _lblAgesa.Text = $"AGESA: {sm.Agesa}";
+        _lblAgesa.Visible = sm.Agesa != "";
         _lblBios.Text = $"BIOS: {sm.BiosVersion}";
 
         var warns = new List<string>();
@@ -397,7 +435,9 @@ public sealed class MainForm : Form
             _btnPerCore.Enabled = _hw.SmuAvailable && _hw.Amd!.Smu.Messages.HasCurveOptimizer;
             // The ratio stepper drives the Intel turbo table; nothing on the SMU side steps safely on a timer.
             _autoPanel.Visible = false;
-            _toolRow.Height = 38;
+            _toolRow.Height = 34;
+            // The live line reports Intel P/E/ring ratios and VID; on AMD it would only hold an empty row.
+            _lblLive.Visible = false;
         }
         else _btnPerCore.Enabled = _hw.Cpu != null;
         SetStatus($"Ready  ·  {_hw.DriverStatus}", false);
@@ -450,20 +490,13 @@ public sealed class MainForm : Form
 
     private void SlowTick()
     {
-        if (_hw.Cpu == null || _applying) return;
+        if (_applying) return;
+        if (_hw.IsAmd) { AmdTick(); return; }
+        if (_hw.Cpu == null) return;
         var live = _hw.ReadLive();
         _lblLive.Text = $"Live: P x{live.CoreRatio?.ToString() ?? "?"} E x{live.ECoreRatio?.ToString() ?? "?"} Ring x{live.RingRatio?.ToString() ?? "?"} | VID {live.CoreVid?.ToString("0.000") ?? "?"} V | " +
             (live.VcoreVrm is double rail ? $"Vcore {rail:0.000} V" : "Vcore unavailable");
-        if (!_bclkBusy)
-        {
-            _bclkBusy = true;
-            Task.Run(() => { try { _hw.MeasureBclk(); } finally { _bclkBusy = false; } });
-        }
-        var bclk = _hw.Settings.FirstOrDefault(s => s.Id == "bclk");
-        if (bclk != null && _hw.LastBclk is double lb && _boxes.TryGetValue(bclk, out var bb) && !bb.Focused)
-        {
-            bclk.Current = lb; bb.Text = bclk.Format(lb);
-        }
+        RefreshBclk();
         // Board rails move on their own; keep the read-only rows current.
         foreach (var s in _hw.Settings.Where(s => s.Group == SettingGroup.Board && s.Available))
             if (_boxes.TryGetValue(s, out var box)) { _hw.Refresh(s); box.Text = s.CurrentText; }
@@ -492,12 +525,41 @@ public sealed class MainForm : Form
         }
     }
 
+    /// <summary>Starts a base-clock measurement on a worker and shows the last finished one.</summary>
+    private void RefreshBclk()
+    {
+        if (!_bclkBusy)
+        {
+            _bclkBusy = true;
+            Task.Run(() => { try { _hw.MeasureBclk(); } finally { _bclkBusy = false; } });
+        }
+        var bclk = _hw.Settings.FirstOrDefault(s => s.Id == "bclk");
+        if (bclk != null && _hw.LastBclk is double lb && _boxes.TryGetValue(bclk, out var bb) && !bb.Focused)
+        {
+            bclk.Current = lb; bb.Text = bclk.Format(lb);
+        }
+    }
+
+    /// <summary>AMD: measured base clock, and what the CPU is drawing against each power limit.</summary>
+    private void AmdTick()
+    {
+        RefreshBclk();
+        foreach (var (s, label) in _rangeLabels)
+        {
+            // An apply result stays readable for ten seconds before the live reading takes the label back.
+            if (s.Live == null || (_rowResults.TryGetValue(s, out var shown) && DateTime.UtcNow - shown < TimeSpan.FromSeconds(10))) continue;
+            label.Text = s.Live() is double now ? $"Live {s.Format(now)} {s.Unit}" : IdleText(s);
+            label.ForeColor = Theme.Muted;
+        }
+    }
+
     // ------------------------------------------------------------------ apply
     private void RefreshRows(string? message = null)
     {
+        _rowResults.Clear();
         _hw.RefreshAll();
         foreach (var (s, box) in _boxes) box.Text = s.CurrentText;
-        foreach (var (s, l) in _rangeLabels) { l.Text = s.ReadOnly ? "read-only" : s.RangeText; l.ForeColor = Theme.Muted; }
+        foreach (var (s, l) in _rangeLabels) { l.Text = IdleText(s); l.ForeColor = Theme.Muted; }
         if (message != null) { AppendLog(message); SetStatus(message, false); }
     }
 
@@ -615,7 +677,7 @@ public sealed class MainForm : Form
 
     private void SetRowStatus(Setting s, string text, Color color)
     {
-        if (_statusLabels.TryGetValue(s, out var l)) { l.Text = text; l.ForeColor = color; _resultTip.SetToolTip(l, s.LastError ?? s.Note); }
+        if (_statusLabels.TryGetValue(s, out var l)) { l.Text = text; l.ForeColor = color; _resultTip.SetToolTip(l, s.LastError ?? RowTip(s)); _rowResults[s] = DateTime.UtcNow; }
     }
 
     private void RestoreDefaults()
@@ -630,8 +692,9 @@ public sealed class MainForm : Form
             _hw.RefreshAll();
             BeginInvoke(() =>
             {
+                _rowResults.Clear();
                 foreach (var (s, box) in _boxes) box.Text = s.CurrentText;
-                foreach (var (s, l) in _rangeLabels) { l.Text = s.ReadOnly ? "read-only" : s.RangeText; l.ForeColor = Theme.Muted; }
+                foreach (var (s, l) in _rangeLabels) { l.Text = IdleText(s); l.ForeColor = Theme.Muted; }
             });
             string result = failures == 0 ? "Reset: start-up values restored." : $"Reset: {failures} setting(s) failed; see Log.";
             AppendLog(result);

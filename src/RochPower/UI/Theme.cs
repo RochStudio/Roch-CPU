@@ -10,7 +10,8 @@ public static class Theme
 {
     public static bool IsDark { get; private set; } = LoadDark();
     private static string PreferencePath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Roch CPU", "theme.txt");
-    private static bool LoadDark() { try { return File.ReadAllText(PreferencePath).Trim() != "light"; } catch { return true; } }
+    /// <summary>Light unless the user has chosen dark.</summary>
+    private static bool LoadDark() { try { return File.ReadAllText(PreferencePath).Trim() == "dark"; } catch { return false; } }
     private static Color Tone(string dark, string light) => ColorTranslator.FromHtml(IsDark ? dark : light);
     // Palette shared with Roch Viewer's dark theme, taken from its own constants so the two
     // tools read as one family rather than merely similar.
@@ -18,8 +19,8 @@ public static class Theme
     public static Color Panel => Tone("#161616", "#FFFFFF");
     public static Color PanelAlt => Tone("#1A1A1A", "#E8EEF5");
     public static Color Header => Tone("#1C1C1C", "#E2E8F0");
-    /// <summary>Title bar: a grey strip above the black body, as in Roch Viewer.</summary>
-    public static Color TitleBar => Header;
+    /// <summary>Title bar: the same colour as the body, so the window reads as one surface.</summary>
+    public static Color TitleBar => Bg;
     public static Color Highlight => Tone("#171717", "#EDF2F7");
     public static Color Border => Tone("#2A2A2A", "#CBD5E1");
     public static Color Text => Tone("#FFFFFF", "#0F172A");
@@ -142,6 +143,10 @@ public static class Theme
     // system's own title bars draw, so the buttons match every other window on the desktop.
     public const string GlyphMinimise = "";
     public const string GlyphClose = "";
+    public const string GlyphSun = "";
+    public const string GlyphMoon = "";
+    /// <summary>The theme button shows where it goes: a moon in light mode, a sun in dark mode.</summary>
+    public static string GlyphTheme => IsDark ? GlyphSun : GlyphMoon;
 
     /// <summary>
     /// Title-bar glyph button (minimise / close): sits flat on the title bar until hovered, then
