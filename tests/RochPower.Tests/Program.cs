@@ -263,7 +263,67 @@ Test("ASUS Cache SVID matches the captured descriptor and preserves adaptive off
     Check(BitConverter.ToUInt32(payload, 12) == 1050, "Cache target index differs from captured encoding");
     Throws<IOException>(() => AsusBoardControl.ParseSvid(bytes, 92, AsusBoardControl.SaId));
 });
+Test("DDR5 VDD above the 5 mV-step ceiling is refused, not clamped", () =>
+{
+    var bus = new FakePmicBus(stepMv: 5, vdd: 1.410);
+    var dimm = Ddr5Dimm.Probe(bus).Single();
+    Check(dimm.VddStepMv == 5 && Math.Abs(dimm.VddCeilingV - 1.435) < 1e-9, "5 mV step or its 1.435 V ceiling not detected");
+    byte before = bus.Pmic[Ddr5Dimm.R_SWA_VOUT];
+    Throws<ArgumentOutOfRangeException>(() => dimm.WriteVdd(1.5));
+    Check(bus.Pmic[Ddr5Dimm.R_SWA_VOUT] == before, "Refused VDD request still wrote the PMIC");
+    dimm.WriteVdd(1.435);
+    Check(Math.Abs(dimm.ReadVdd()!.Value - 1.435) < 1e-9, "Ceiling value not written");
+});
+Test("DDR5 VDD at the 10 mV step reaches 1.5 V", () =>
+{
+    var bus = new FakePmicBus(stepMv: 10, vdd: 1.450);
+    var dimm = Ddr5Dimm.Probe(bus).Single();
+    Check(dimm.VddStepMv == 10 && Math.Abs(dimm.VddCeilingV - Ddr5Dimm.VddMaxV) < 1e-9, "10 mV step ceiling wrong");
+    dimm.WriteVdd(1.5);
+    Check(Math.Abs(dimm.ReadVdd()!.Value - 1.5) < 1e-9, "1.5 V not written at the 10 mV step");
+});
 Console.WriteLine($"{passed} regression checks passed; no kernel driver was opened.");
+
+/// <summary>One DDR5 DIMM in slot A2: SPD5118 hub at 0x51 and a PMIC at 0x49 whose VDD/VDDQ step is fixed.</summary>
+sealed class FakePmicBus : ISmbus
+{
+    public readonly byte[] Pmic = new byte[256];
+    private readonly int _stepMv;
+    public FakePmicBus(int stepMv, double vdd)
+    {
+        _stepMv = stepMv;
+        Pmic[Ddr5Dimm.R_SWA_VOUT] = Code(vdd, 800, stepMv);
+        Pmic[Ddr5Dimm.R_SWC_VOUT] = Code(vdd, 800, stepMv);
+        Pmic[Ddr5Dimm.R_SWD_VOUT] = Code(1.8, 1500, 5);
+    }
+    private static byte Code(double v, int baseMv, int step) => (byte)((int)Math.Round((v * 1000 - baseMv) / step) << 1);
+    private static double Volts(byte raw, int baseMv, int step) => (baseMv + step * (raw >> 1)) / 1000.0;
+    public string Description => "fake PMIC bus";
+    public bool ReadByte(byte address, byte command, out byte value)
+    {
+        value = 0;
+        if (address == 0x51) { value = command == 0 ? (byte)0x51 : (byte)0; return true; }
+        if (address != 0x49) return false;
+        if (command == Ddr5Dimm.R_ADC_READ)
+        {
+            int select = (Pmic[Ddr5Dimm.R_ADC_ENABLE] >> 3) & 0xF;
+            double v = select switch
+            {
+                Ddr5Dimm.ADC_SWA => Volts(Pmic[Ddr5Dimm.R_SWA_VOUT], 800, _stepMv),
+                Ddr5Dimm.ADC_SWC => Volts(Pmic[Ddr5Dimm.R_SWC_VOUT], 800, _stepMv),
+                Ddr5Dimm.ADC_SWD => Volts(Pmic[Ddr5Dimm.R_SWD_VOUT], 1500, 5),
+                _ => 0
+            };
+            value = (byte)Math.Round(v / 0.015);
+            return true;
+        }
+        value = Pmic[command];
+        return true;
+    }
+    public bool WriteByte(byte address, byte command, byte value) { if (address != 0x49) return false; Pmic[command] = value; return true; }
+    public bool ReadWord(byte address, byte command, out ushort value) { value = 0; return false; }
+    public void Dispose() { }
+}
 
 sealed class FakeDriver : IKernelDriver
 {

@@ -759,17 +759,21 @@ public sealed class HardwareModel : IDisposable
             Settings.Add(new Setting
             {
                 Id = $"{dimm.SlotName.ToLowerInvariant()}_vdd", Name = $"DRAM {dimm.SlotName} Voltage", Group = SettingGroup.Memory, Unit = "V",
-                Min = Ddr5Dimm.VddMinV, Max = Ddr5Dimm.VddMaxV, Decimals = 3,
+                Min = Ddr5Dimm.VddMinV, Max = dimm.VddCeilingV, Decimals = 3,
                 Read = dimm.ReadVdd, Write = dimm.VddVerified ? dimm.WriteVdd : null,
-                Note = $"VDD set-point on the PMIC of {dimm.SlotName} (0x{dimm.PmicAddress:X2}, {dimm.PmicVendor}), register step {(dimm.VddVerified ? dimm.VddStepMv + " mV" : "unknown")}." + (dimm.VddVerified ? "" : unverified),
+                LimitNote = dimm.VddVerified ? Ddr5Dimm.StepLimitNote(dimm.VddStepMv) : null,
+                Note = $"VDD set-point on the PMIC of {dimm.SlotName} (0x{dimm.PmicAddress:X2}, {dimm.PmicVendor}), register step {(dimm.VddVerified ? dimm.VddStepMv + " mV" : "unknown")}." + (dimm.VddVerified ? "" : unverified)
+                       + (dimm.VddVerified && dimm.VddStepMv == 5 ? " " + Ddr5Dimm.StepLimitNote(5) : ""),
                 Available = dimm.HasPmic
             });
             Settings.Add(new Setting
             {
                 Id = $"{dimm.SlotName.ToLowerInvariant()}_vddq", Name = $"DRAM {dimm.SlotName} VDDQ Voltage", Group = SettingGroup.Memory, Unit = "V",
-                Min = Ddr5Dimm.VddqMinV, Max = Ddr5Dimm.VddqMaxV, Decimals = 3,
+                Min = Ddr5Dimm.VddqMinV, Max = dimm.VddqCeilingV, Decimals = 3,
                 Read = dimm.ReadVddq, Write = dimm.VddqVerified ? dimm.WriteVddq : null,
-                Note = $"VDDQ set-point (PMIC SWC rail), register step {(dimm.VddqVerified ? dimm.VddqStepMv + " mV" : "unknown")}." + (dimm.VddqVerified ? "" : unverified), Available = dimm.HasPmic
+                LimitNote = dimm.VddqVerified ? Ddr5Dimm.StepLimitNote(dimm.VddqStepMv) : null,
+                Note = $"VDDQ set-point (PMIC SWC rail), register step {(dimm.VddqVerified ? dimm.VddqStepMv + " mV" : "unknown")}." + (dimm.VddqVerified ? "" : unverified)
+                       + (dimm.VddqVerified && dimm.VddqStepMv == 5 ? " " + Ddr5Dimm.StepLimitNote(5) : ""), Available = dimm.HasPmic
             });
             Settings.Add(new Setting
             {
@@ -872,7 +876,7 @@ public sealed class HardwareModel : IDisposable
             }
             if (value < s.Min || value > s.Max)
             {
-                return Fail($"{s.Format(value)} is outside {s.RangeText}.");
+                return Fail($"{s.Format(value)} is outside {s.RangeText}." + (value > s.Max && !string.IsNullOrEmpty(s.LimitNote) ? " " + s.LimitNote : ""));
             }
             s.Write(value);
             Refresh(s);

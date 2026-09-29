@@ -23,6 +23,8 @@ public sealed class Setting
     /// <summary>Called when the user enters 0 (restore default). Null: write DefaultValue.</summary>
     public Action? RestoreDefault { get; init; }
     public string? Note { get; init; }
+    /// <summary>Why Max is where it is, when that is not obvious; added to the out-of-range message.</summary>
+    public string? LimitNote { get; init; }
     public bool Available { get; set; } = true;
     public bool RequireReadBack { get; init; }
 

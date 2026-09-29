@@ -58,6 +58,22 @@ public sealed class Ddr5Dimm
     public int VddqStepMv { get; private set; }
     public bool VddqVerified => VddqStepMv != 0;
     public bool VppVerified { get; private set; }
+
+    /// <summary>
+    /// The highest VDD / VDDQ the register can hold at the calibrated step: 7 bits above 800 mV, so
+    /// 1.435 V at the JEDEC 5 mV step and 2.070 V at 10 mV (capped at the rail's own maximum).
+    /// Anything above it used to be clamped to the top code without a word.
+    /// </summary>
+    public double VddCeilingV => VddVerified ? Math.Min(VddMaxV, Decode(0xFE, 800, VddStepMv)) : VddMaxV;
+    public double VddqCeilingV => VddqVerified ? Math.Min(VddqMaxV, Decode(0xFE, 800, VddqStepMv)) : VddqMaxV;
+
+    /// <summary>
+    /// Why a rail stops at 1.435 V. Seen on a G.Skill kit (PMIC 8A12): with the BIOS at 1.41 V the PMIC
+    /// runs the 5 mV step; with the BIOS above 1.435 V it runs a 10 mV step and 1.5 V could be set here.
+    /// </summary>
+    public static string StepLimitNote(int stepMv) => stepMv == 5
+        ? "At the JEDEC 5 mV step this PMIC's register tops out at 1.435 V. The BIOS switches it to the 10 mV step when DRAM voltage is set above 1.435 V there; do that once, then higher values can be set here."
+        : "";
     public bool AdcWritable { get; private set; }
     public string CalibrationNote { get; private set; } = "not calibrated";
 
@@ -188,7 +204,7 @@ public sealed class Ddr5Dimm
     public void WriteVdd(double volts)
     {
         if (!VddVerified) throw new InvalidOperationException($"{SlotName}: VDD scale not verified against the PMIC ADC; write refused for safety.");
-        if (volts < VddMinV || volts > VddMaxV) throw new ArgumentOutOfRangeException(nameof(volts), $"VDD must be {VddMinV:0.000}-{VddMaxV:0.000} V.");
+        if (volts < VddMinV || volts > VddCeilingV) throw new ArgumentOutOfRangeException(nameof(volts), $"VDD must be {VddMinV:0.000}-{VddCeilingV:0.000} V. {StepLimitNote(VddStepMv)}".TrimEnd());
         byte v = Encode(volts, 800, VddStepMv);
         WriteRail(R_SWA_VOUT, v, "VDD", ADC_SWA, Decode(v, 800, VddStepMv));
         // Second VDD phase (SWB) mirrors SWA on dual-rail PMICs; 0 means it follows SWA and must be left alone.
@@ -198,7 +214,7 @@ public sealed class Ddr5Dimm
     public void WriteVddq(double volts)
     {
         if (!VddqVerified) throw new InvalidOperationException($"{SlotName}: VDDQ scale not verified against the PMIC ADC; write refused for safety.");
-        if (volts < VddqMinV || volts > VddqMaxV) throw new ArgumentOutOfRangeException(nameof(volts), $"VDDQ must be {VddqMinV:0.000}-{VddqMaxV:0.000} V.");
+        if (volts < VddqMinV || volts > VddqCeilingV) throw new ArgumentOutOfRangeException(nameof(volts), $"VDDQ must be {VddqMinV:0.000}-{VddqCeilingV:0.000} V. {StepLimitNote(VddqStepMv)}".TrimEnd());
         byte v = Encode(volts, 800, VddqStepMv);
         WriteRail(R_SWC_VOUT, v, "VDDQ", ADC_SWC, Decode(v, 800, VddqStepMv));
     }
