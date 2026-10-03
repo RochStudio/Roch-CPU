@@ -1,3 +1,4 @@
+// Unmodified pre-cache implementation, class name changed for trace comparison. SHA256: 7F04EC5559A01C68F8F2F7EA6AAC5A4DF53901F77E79709621AB70C480A92487
 namespace RochPower.Hardware;
 
 /// <summary>
@@ -10,7 +11,7 @@ namespace RochPower.Hardware;
 /// double a DIMM voltage, every rail is calibrated against the PMIC's own ADC at
 /// start-up and writes are refused for rails whose scale could not be confirmed.
 /// </summary>
-public sealed class Ddr5Dimm
+public sealed class Ddr5DimmLegacy
 {
     public const byte SpdBase = 0x50;
     public const byte PmicBase = 0x48;
@@ -76,23 +77,20 @@ public sealed class Ddr5Dimm
         : "";
     public bool AdcWritable { get; private set; }
     public string CalibrationNote { get; private set; } = "not calibrated";
-    public PmicVoltageMeasurement VddMeasurement { get; private set; } = PmicVoltageMeasurement.NotRead("PMIC ADC SWA");
-    public PmicVoltageMeasurement VddqMeasurement { get; private set; } = PmicVoltageMeasurement.NotRead("PMIC ADC SWC");
-    public PmicVoltageMeasurement VppMeasurement { get; private set; } = PmicVoltageMeasurement.NotRead("PMIC ADC SWD");
 
-    public Ddr5Dimm(ISmbus bus, int slot)
+    public Ddr5DimmLegacy(ISmbus bus, int slot)
     {
         _bus = bus; Slot = slot;
         SlotName = slot switch { 0 => "DIMMA1", 1 => "DIMMA2", 2 => "DIMMB1", 3 => "DIMMB2", _ => $"DIMM{slot}" };
     }
 
     /// <summary>Probe all four slots; a DIMM is present when its SPD5118 hub answers with device type 0x51.</summary>
-    public static List<Ddr5Dimm> Probe(ISmbus bus)
+    public static List<Ddr5DimmLegacy> Probe(ISmbus bus)
     {
-        var list = new List<Ddr5Dimm>();
+        var list = new List<Ddr5DimmLegacy>();
         for (int s = 0; s < 4; s++)
         {
-            var d = new Ddr5Dimm(bus, s);
+            var d = new Ddr5DimmLegacy(bus, s);
             if (!bus.ReadByte(d.SpdAddress, 0x00, out byte mr0) || mr0 != 0x51) continue; // MR0 = 0x51 -> SPD5118 (DDR5)
             d.HasPmic = bus.ReadByte(d.PmicAddress, R_SWA_VOUT, out _);
             if (d.HasPmic && bus.ReadByte(d.PmicAddress, R_VENDOR_LSB, out byte vl) && bus.ReadByte(d.PmicAddress, R_VENDOR_MSB, out byte vh))
@@ -111,87 +109,21 @@ public sealed class Ddr5Dimm
     /// Reads the PMIC ADC for one input selection, restoring the previous ADC configuration
     /// afterwards. Only the ADC mux is touched; regulator outputs are not affected.
     /// </summary>
-    public byte? ReadAdc(int select) => ReadAdcCore(select, out _, out _);
-
-    private byte? ReadAdcCore(int select, out string? error, out DateTimeOffset? sampledAtUtc)
+    public byte? ReadAdc(int select)
     {
-        error = null;
-        sampledAtUtc = null;
-        if (!HasPmic) { error = "No PMIC is available."; return null; }
-        if (!_bus.ReadByte(PmicAddress, R_ADC_ENABLE, out byte saved))
-        { error = "PMIC ADC configuration could not be read."; return null; }
+        if (!HasPmic || !_bus.ReadByte(PmicAddress, R_ADC_ENABLE, out byte saved)) return null;
         try
         {
             byte cfg = (byte)(0x80 | ((select & 0xF) << 3));
-            if (!_bus.WriteByte(PmicAddress, R_ADC_ENABLE, cfg))
-            { error = "PMIC ADC input selection was rejected."; return null; }
+            if (!_bus.WriteByte(PmicAddress, R_ADC_ENABLE, cfg)) return null;
             Thread.Sleep(15);
-            if (!_bus.ReadByte(PmicAddress, R_ADC_ENABLE, out byte back) || back != cfg)
-            { error = "PMIC ADC input selection did not read back."; return null; } // not writable (secure mode)
-            if (!_bus.ReadByte(PmicAddress, R_ADC_READ, out byte v))
-            { error = "PMIC ADC sample could not be read."; return null; }
-            sampledAtUtc = DateTimeOffset.UtcNow;
-            return v;
+            if (!_bus.ReadByte(PmicAddress, R_ADC_ENABLE, out byte back) || back != cfg) return null; // not writable (secure mode)
+            return _bus.ReadByte(PmicAddress, R_ADC_READ, out byte v) ? v : null;
         }
-        catch (Exception ex)
-        {
-            error = "PMIC ADC access failed: " + ex.Message;
-            throw;
-        }
-        finally
-        {
-            try
-            {
-                if (!_bus.WriteByte(PmicAddress, R_ADC_ENABLE, saved))
-                    error = JoinMeasurementErrors(error, "PMIC ADC configuration restore was rejected.");
-            }
-            catch (Exception ex)
-            {
-                error = JoinMeasurementErrors(error, "PMIC ADC configuration restore failed: " + ex.Message);
-                throw;
-            }
-        }
+        finally { _bus.WriteByte(PmicAddress, R_ADC_ENABLE, saved); }
     }
 
-    public double? ReadAdcVolts(int select)
-    {
-        DateTimeOffset attemptAtUtc = DateTimeOffset.UtcNow;
-        string? error = null;
-        DateTimeOffset? sampledAtUtc = null;
-        try
-        {
-            double? value = ReadAdcCore(select, out error, out sampledAtUtc) is byte b ? b * AdcRailVoltsPerLsb : null;
-            CacheMeasurement(select, value, sampledAtUtc, attemptAtUtc, error);
-            return value; // Preserve existing calibration/verification return behavior, including failed restore.
-        }
-        catch (Exception ex)
-        {
-            CacheMeasurement(select, null, null, attemptAtUtc, error ?? "PMIC ADC access failed: " + ex.Message);
-            throw;
-        }
-    }
-
-    private static string JoinMeasurementErrors(string? previous, string next) =>
-        previous == null ? next : previous + " " + next;
-
-    private void CacheMeasurement(int select, double? value, DateTimeOffset? sampledAtUtc,
-        DateTimeOffset attemptAtUtc, string? error)
-    {
-        PmicVoltageMeasurement? previous = select switch
-        {
-            ADC_SWA => VddMeasurement, ADC_SWC => VddqMeasurement, ADC_SWD => VppMeasurement, _ => null
-        };
-        if (previous == null) return; // Unknown inputs never become a DIMM rail measurement.
-        var next = error == null && value.HasValue && sampledAtUtc.HasValue
-            ? new PmicVoltageMeasurement(value, sampledAtUtc, attemptAtUtc, null, previous.Source)
-            : previous with { LastAttemptAtUtc = attemptAtUtc, LastError = error ?? "PMIC ADC sample was not read." };
-        switch (select)
-        {
-            case ADC_SWA: VddMeasurement = next; break;
-            case ADC_SWC: VddqMeasurement = next; break;
-            case ADC_SWD: VppMeasurement = next; break;
-        }
-    }
+    public double? ReadAdcVolts(int select) => ReadAdc(select) is byte b ? b * AdcRailVoltsPerLsb : null;
 
     // ---------------------------------------------------------------- calibration
     /// <summary>Compares each rail's register decode with the ADC and records which scales are trustworthy.</summary>

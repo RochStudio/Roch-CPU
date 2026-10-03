@@ -153,17 +153,38 @@ Or `dotnet publish src/RochPower -c Release -o dist`.
 
 ## Using it
 
-* Every row is a name, the allowed range, and a typeable value. Type and press **Apply** (or
-  Enter). The window sizes itself so nothing scrolls, and controls this system does not have are
-  hidden rather than greyed out.
-* **0** restores what the row held when Roch CPU *started* — so if you raise a value, close the
+* Setting rows show names and values. Hover individual writable settings for their allowed
+  ranges and control notes. Type and press **Apply** (or Enter). Unavailable controls are hidden,
+  except **CPU Core Voltage**, which remains visible
+  and disabled with its detection reason when the core regulator cannot be verified.
+  On supported MSI boards, one automatic startup check reads core page 0 and restores and
+  verifies the previously selected regulator page without changing voltage or mode targets.
+  A successful check enables the existing regulator-and-mailbox control before its first display.
+  The startup result and failure details are recorded in **Log**. A failed check leaves the row
+  disabled. While regulator page 1 is selected, target reads retain the last verified core page 0
+  snapshot; ordinary refreshes do not switch pages.
+* **0** restores what the row held when Roch CPU *started* - so if you raise a value, close the
   window and reopen it, that becomes the new starting point. Reboot to get back to BIOS values. A
-  voltage override goes back to *Auto*. On AMD, PPT / TDC / EDC cannot be read at start-up, so 0
+  voltage override goes back to *Auto*; MSI CPU Core Voltage disables override rather than
+  restoring a captured override target. On AMD, PPT / TDC / EDC cannot be read at start-up, so 0
   writes the CPU's stock limit.
-* Read-only rows refresh automatically; **Reset** writes the start-up values back.
+  Use **Split DIMMs** to restore individual DIMM startup values, which may differ.
+* Read-only rows refresh automatically. **Reset to Default** applies the existing default action
+  only to changed available writable settings and clears unsaved drafts. Depending on the control,
+  it restores a recorded startup value, Auto/adaptive behavior, or an existing CPU default;
+  AMD power limits use stock limits and Curve Optimizer returns to zero. It does not reset
+  factory BIOS settings.
+* Voltage boxes show targets or **Auto**. The original header retains the board Vcore sensor
+  reading and VID as separate values. Memory boxes show PMIC setpoints; additional sensor
+  readout rows and allowed range/step hints are omitted from the main layout. Capability,
+  exact supported-grid validation and per-control safety limits still apply.
 * **Per-Core Ratio Table** (Intel) and **Curve Optimizer** (AMD) open the per-core dialogs.
-* **Auto ratio step** (Intel) raises the ratio every *n* seconds until a write is rejected or you
-  press Stop. Run a stress test beside it.
+* **Sync DIMMs** is the default and shows one shared target each for VDD, VDDQ and VPP.
+  **Split DIMMs** shows each DIMM's targets separately. Sync links matching rails across DIMMs
+  without linking those three rails to one another. Unequal current targets remain mixed until
+  you edit a shared target. Changing mode or editing targets stages values only; **Apply**
+  performs the existing hardware writes. Sync accepts only exact common supported targets and
+  blocks a rail with an unavailable or read-only peer.
 * **Log** explains every failure: a locked MSR, a rejected mailbox value, a PMIC in secure mode, an
   SMBus hidden by the BIOS, a driver Windows would not load.
 

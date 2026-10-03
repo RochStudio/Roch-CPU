@@ -13,7 +13,7 @@ public sealed class PerCoreForm : Form
     private readonly TextBox[] _e = new TextBox[8];
     private readonly Label[] _pLabels = new Label[8];
     private readonly Label[] _eLabels = new Label[8];
-    private readonly Label _status = Theme.Label("", Theme.Small, Theme.Muted);
+    private readonly Label _status = Theme.Label("", Theme.Small, Theme.Text);
 
     public PerCoreForm(HardwareModel hw)
     {
@@ -112,7 +112,7 @@ public sealed class PerCoreForm : Form
                 cpu.WriteECoreTurboTable(er);
             }
             Fill();
-            _status.Text = $"Tables read back at {DateTime.Now:HH:mm:ss}; live clocks depend on CPU limits."; _status.ForeColor = Theme.Muted;
+            _status.Text = $"Tables read back at {DateTime.Now:HH:mm:ss}; live clocks depend on CPU limits."; _status.ForeColor = Theme.Text;
         }
         catch (Exception ex) { _status.Text = ex.Message; _status.ForeColor = Theme.Danger; }
     }

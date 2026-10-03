@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PlatformTarget>x64</PlatformTarget>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../src/RochPower/Hardware/CorePageProbe.cs" Link="CorePageProbe.cs" />
+    <Compile Include="../../src/RochPower/Hardware/EcMailbox.cs" Link="EcMailbox.cs" />
+    <Compile Include="../../src/RochPower/Hardware/StartupIoDiagnostics.cs" Link="StartupIoDiagnostics.cs" />
+    <Compile Include="../../src/RochPower/Hardware/SuperIo.cs" Link="SuperIo.cs" />
+    <Compile Include="../../src/RochPower/Hardware/IKernelDriver.cs" Link="IKernelDriver.cs" />
+    <Compile Include="../../src/RochPower/Hardware/OcMailbox.cs" Link="OcMailbox.cs" />
+    <Compile Include="../../src/RochPower/Hardware/MsiCoreVoltage.cs" Link="MsiCoreVoltage.cs" />
+    <Compile Include="../../src/RochPower/Hardware/CoreVoltagePairTransaction.cs" Link="CoreVoltagePairTransaction.cs" />
+  </ItemGroup>
+</Project>

@@ -13,7 +13,7 @@ public sealed class CurveOptimizerForm : Form
     private readonly HardwareModel _hw;
     private readonly AmdCpu _cpu;
     private readonly List<(AmdCore core, TextBox box, Label status)> _rows = new();
-    private readonly Label _status = Theme.Label("", Theme.Small, Theme.Muted);
+    private readonly Label _status = Theme.Label("", Theme.Small, Theme.Text);
 
     public CurveOptimizerForm(HardwareModel hw)
     {
@@ -77,7 +77,7 @@ public sealed class CurveOptimizerForm : Form
             if (m is int v) box.Text = v.ToString();
             else { unread++; if (box.Text.Length == 0) box.Text = "0"; }
         }
-        _status.ForeColor = Theme.Muted;
+        _status.ForeColor = Theme.Text;
         _status.Text = unread == 0 ? "Values read from the SMU." : _cpu.Smu.Messages.HasCurveOptimizerReadback
             ? $"{unread} core(s) did not answer; those fields show the last value applied here."
             : "No read-back on this SMU; fields show the last value applied here (0 if none).";
@@ -94,12 +94,12 @@ public sealed class CurveOptimizerForm : Form
             try
             {
                 _hw.ApplyCurveOptimizer(core, margin);
-                status.Text = core.Location; status.ForeColor = Theme.Muted; ok++;
+                status.Text = core.Location; status.ForeColor = Theme.Text; ok++;
             }
             catch (Exception ex) { status.Text = ex.Message; status.ForeColor = Theme.Danger; failed++; }
         }
         _status.Text = failed == 0 ? $"Applied {ok} core(s) at {DateTime.Now:HH:mm:ss}." : $"{ok} applied, {failed} failed.";
-        _status.ForeColor = failed == 0 ? Theme.Muted : Theme.Danger;
+        _status.ForeColor = failed == 0 ? Theme.Text : Theme.Danger;
         if (_cpu.Smu.Messages.HasCurveOptimizerReadback) Fill();
     }
 }

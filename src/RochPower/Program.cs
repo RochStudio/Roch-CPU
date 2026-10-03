@@ -11,6 +11,21 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        // This branch returns before diagnostics and the production constructor. The preview
+        // does not create HardwareModel, initialize drivers, run timers or save user preferences.
+        if (args.Length > 0 && args[0].Equals("--ui-preview", StringComparison.OrdinalIgnoreCase))
+        {
+            ApplicationConfiguration.Initialize();
+            Theme.ConfigurePreview(args.Skip(1).Any(arg => arg.Equals("--dark", StringComparison.OrdinalIgnoreCase)));
+            bool scrollBottom = args.Skip(1).Any(arg => arg.Equals("--scroll-bottom", StringComparison.OrdinalIgnoreCase));
+            bool verifiedCore = args.Skip(1).Any(arg => arg.Equals("--verified-core", StringComparison.OrdinalIgnoreCase));
+            bool splitDimms = args.Skip(1).Any(arg => arg.Equals("--split-dimms", StringComparison.OrdinalIgnoreCase));
+            string? voltageReadings = args.Skip(1).FirstOrDefault(arg => arg.StartsWith("--voltage-readings=", StringComparison.OrdinalIgnoreCase))?.Split('=', 2)[1].ToLowerInvariant();
+            if (voltageReadings is not (null or "auto-mixed" or "error")) return 2;
+            Application.Run(MainForm.CreateUiPreview(scrollBottom, verifiedCore, splitDimms, voltageReadings: voltageReadings));
+            return 0;
+        }
+
         // The diagnostic switches print to the console they were launched from; a WinExe has none of its own.
         if (args.Length > 0) Native.AttachConsole(Native.ATTACH_PARENT_PROCESS);
 

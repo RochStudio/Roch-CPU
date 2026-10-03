@@ -23,7 +23,7 @@ public sealed class LiveStatus
 /// Owns every hardware object and exposes the tunables as a flat list of
 /// <see cref="Setting"/>s that the UI renders. All board-independent.
 /// </summary>
-public sealed class HardwareModel : IDisposable
+public sealed partial class HardwareModel : IDisposable
 {
     public event Action<string>? Log;
 
@@ -158,8 +158,8 @@ public sealed class HardwareModel : IDisposable
                     Emit("Board rails: " + (rails.Count == 0 ? "none readable" : string.Join(", ", rails.Select(r => $"{r.Name} {r.Volts:0.000} V"))));
 
                     // The clock generator sits on the EC's own I2C bus, so it is only reachable
-                    // where that mailbox exists. Nothing is written here; the controller reads its
-                    // baseline and does not touch the clock until a value is applied.
+                    // where that mailbox exists. The clock controller reads its baseline and
+                    // does not change the clock until a value is applied.
                     if (EcMailbox.IsSupported(SuperIo))
                     {
                         var mailbox = new EcMailbox(SuperIo);
@@ -167,9 +167,9 @@ public sealed class HardwareModel : IDisposable
                                      || Smbios.SystemManufacturer.Contains("Micro-Star", StringComparison.OrdinalIgnoreCase);
                         if (Cpu != null && msiBoard)
                         {
-                            CoreVoltage = MsiCoreVoltage.TryCreate(mailbox, out string coreVoltageStatus);
-                            CoreVoltageStatus = coreVoltageStatus;
-                            Emit("CPU core regulator: " + coreVoltageStatus);
+                            // One bounded core-PAGE read/restore, before constructing the target row.
+                            // No voltage/mode target is changed, and periodic refresh never selects PAGE.
+                            InitializeCoreVoltage();
                         }
                         if (Cpu is { } bclkCpu && Bclk is { IsAvailable: true } bclkMeter)
                         {
@@ -223,11 +223,17 @@ public sealed class HardwareModel : IDisposable
                 {
                     var core = Cpu.Mailbox.ReadDomain(OcMailbox.DOMAIN_CORE);
                     BiosCoreOverride = core.OverrideMode;
+                    try { Emit("Startup OC mailbox core read succeeded (decoded): " + core); }
+                    catch { } // Diagnostic logging must not affect startup control.
                     if (BiosCoreOverride)
                         Emit($"BIOS has the core voltage in Override mode ({core.TargetVolts:0.000} V). " +
                              "The board regulator path will also be probed before CPU Core Voltage is made writable; the measured Vcore rail is checked after each change.");
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    try { Emit("Startup OC mailbox core read failed: " + ex.Message); }
+                    catch { }
+                }
             }
         }
         catch (Exception ex) { Emit("CPU init error: " + ex.Message); }
@@ -327,24 +333,7 @@ public sealed class HardwareModel : IDisposable
                 return;
             }
 
-            // MSI programs the board regulator first and the CPU request second. Keep a complete
-            // regulator snapshot so a rejected OC-mailbox write cannot leave the two disagreeing.
-            var before = CoreVoltage.ReadState();
-            var mailboxBefore = mb!.ReadDomain(domain);
-            CoreVoltage.SetOverride(volts);
-            try
-            {
-                mb.SetOverride(domain, volts);
-                var after = mb.ReadDomain(domain);
-                if (!after.OverrideMode || Math.Abs(after.TargetVolts - volts) > 0.0011)
-                    throw new IOException($"Intel mailbox did not retain {volts:0.000} V (read back {after.TargetVolts:0.000} V)");
-            }
-            catch
-            {
-                try { mb.WriteDomain(domain, mailboxBefore); } catch { }
-                try { CoreVoltage.Restore(before); } catch { }
-                throw;
-            }
+            WriteMsiCoreOverride(volts);
         }
         void ClearOverride(int domain)
         {
@@ -354,21 +343,7 @@ public sealed class HardwareModel : IDisposable
                 return;
             }
 
-            var before = CoreVoltage.ReadState();
-            var mailboxBefore = mb!.ReadDomain(domain);
-            CoreVoltage.DisableOverride();
-            try
-            {
-                mb.SetOverride(domain, 0);
-                if (mb.ReadDomain(domain).OverrideMode)
-                    throw new IOException("Intel mailbox remained in override mode");
-            }
-            catch
-            {
-                try { mb.WriteDomain(domain, mailboxBefore); } catch { }
-                try { CoreVoltage.Restore(before); } catch { }
-                throw;
-            }
+            ClearMsiCoreOverride();
         }
         void AddDomain(string idPrefix, string name, int domain, double minV, double maxV, bool available)
         {
@@ -792,7 +767,9 @@ public sealed class HardwareModel : IDisposable
             if (!s.Available) { s.Current = null; continue; }
             try { s.Current = s.Read(); }
             catch (Exception ex) { s.Current = null; Emit($"{s.Name}: read failed - {ex.Message}"); }
-            if (captureDefaults) s.DefaultValue = s.Current;
+            if (captureDefaults)
+                s.DefaultValue = s.Id == "core_v" && CoreVoltage?.VerifiedBaseline is { } coreBaseline
+                    ? coreBaseline.TargetVolts : s.Current;
         }
     }
 

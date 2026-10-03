@@ -35,9 +35,32 @@ public sealed class EcMailbox
     private const int DoorbellTimeoutMs = 250;
 
     private readonly SuperIo _sio;
+    private readonly bool _strictIo;
     private readonly object _lock = new();
 
-    public EcMailbox(SuperIo sio) => _sio = sio;
+    public EcMailbox(SuperIo sio, bool strictIo = false) { _sio = sio; _strictIo = strictIo; }
+    public EcMailbox WithStrictIo() => new(_sio, strictIo: true);
+    private byte ReadRaw(ushort address)
+    {
+        try
+        {
+            byte value = _strictIo ? _sio.ReadRawStrict(address) : _sio.ReadRaw(address);
+            StartupIoDiagnostics.ObserveEcRead(address, value);
+            return value;
+        }
+        catch (Exception ex) { StartupIoDiagnostics.ObserveEcFailure(address, false, ex); throw; }
+    }
+
+    private bool WriteRaw(ushort address, byte value)
+    {
+        try
+        {
+            bool ok = _strictIo ? _sio.WriteRawStrict(address, value) : _sio.WriteRaw(address, value);
+            StartupIoDiagnostics.ObserveEcWrite(address, value, ok);
+            return ok;
+        }
+        catch (Exception ex) { StartupIoDiagnostics.ObserveEcFailure(address, true, ex); throw; }
+    }
 
     /// <summary>Only MSI's EC-space Nuvoton parts carry this mailbox.</summary>
     public static bool IsSupported(SuperIo? sio) => sio is { Kind: SuperIoKind.NuvotonEc };
@@ -48,21 +71,21 @@ public sealed class EcMailbox
         var sw = System.Diagnostics.Stopwatch.StartNew();
         do
         {
-            if (_sio.ReadRaw(R_DOORBELL) == DOORBELL_IDLE) return true;
+            if (ReadRaw(R_DOORBELL) == DOORBELL_IDLE) return true;
             Thread.Sleep(1);
         } while (sw.ElapsedMilliseconds < DoorbellTimeoutMs);
         return false;
     }
 
-    private bool Ring(byte go) => _sio.WriteRaw(R_DOORBELL, go) && WaitDoorbell();
+    private bool Ring(byte go) => WriteRaw(R_DOORBELL, go) && WaitDoorbell();
 
     private bool Stage(byte command, byte address, byte register)
     {
         // The vendor tool reads each of these back after writing it. Keeping that check means a
         // mailbox busy with someone else's transaction is noticed before the doorbell is rung.
-        if (!_sio.WriteRaw(R_COMMAND, command) || _sio.ReadRaw(R_COMMAND) != command) return false;
-        if (!_sio.WriteRaw(R_ADDRESS, address) || _sio.ReadRaw(R_ADDRESS) != address) return false;
-        if (!_sio.WriteRaw(R_REGISTER, register) || _sio.ReadRaw(R_REGISTER) != register) return false;
+        if (!WriteRaw(R_COMMAND, command) || ReadRaw(R_COMMAND) != command) return false;
+        if (!WriteRaw(R_ADDRESS, address) || ReadRaw(R_ADDRESS) != address) return false;
+        if (!WriteRaw(R_REGISTER, register) || ReadRaw(R_REGISTER) != register) return false;
         return true;
     }
 
@@ -77,31 +100,39 @@ public sealed class EcMailbox
             if (write is ushort w)
             {
                 byte lo = (byte)w;
-                if (!_sio.WriteRaw(R_WDATA_LO, lo) || _sio.ReadRaw(R_WDATA_LO) != lo) return false;
+                if (!WriteRaw(R_WDATA_LO, lo) || ReadRaw(R_WDATA_LO) != lo) return false;
                 if (command == CMD_WRITE_WORD)
                 {
                     byte hi = (byte)(w >> 8);
-                    if (!_sio.WriteRaw(R_WDATA_HI, hi) || _sio.ReadRaw(R_WDATA_HI) != hi) return false;
+                    if (!WriteRaw(R_WDATA_HI, hi) || ReadRaw(R_WDATA_HI) != hi) return false;
                 }
                 return Ring(GO_LATCH);
             }
 
             if (!Ring(GO_TRANSFER)) return false;
             if (!Ring(GO_LATCH)) return false;
-            read = _sio.ReadRaw(R_RDATA_LO);
-            if (command == CMD_READ_WORD) read |= (ushort)(_sio.ReadRaw(R_RDATA_HI) << 8);
+            read = ReadRaw(R_RDATA_LO);
+            if (command == CMD_READ_WORD) read |= (ushort)(ReadRaw(R_RDATA_HI) << 8);
             return true;
         }
     }
 
     // ---------------------------------------------------------------- transfers
     /// <summary>Reads one byte from a device on the EC's I2C bus.</summary>
-    public byte? ReadByte(byte address, byte register) =>
-        Transact(CMD_READ_BYTE, address, register, null, out ushort v) ? (byte)v : null;
+    public byte? ReadByte(byte address, byte register)
+    {
+        byte? value = Transact(CMD_READ_BYTE, address, register, null, out ushort v) ? (byte)v : null;
+        StartupIoDiagnostics.ObserveRegisterRead(address, register, value, false);
+        return value;
+    }
 
     /// <summary>Reads one 16-bit register from a device on the EC's I2C bus.</summary>
-    public ushort? ReadWord(byte address, byte register) =>
-        Transact(CMD_READ_WORD, address, register, null, out ushort v) ? v : null;
+    public ushort? ReadWord(byte address, byte register)
+    {
+        ushort? value = Transact(CMD_READ_WORD, address, register, null, out ushort v) ? v : null;
+        StartupIoDiagnostics.ObserveRegisterRead(address, register, value, true);
+        return value;
+    }
 
     /// <summary>Writes one byte to a device on the EC's I2C bus.</summary>
     public bool WriteByte(byte address, byte register, byte value) =>

@@ -41,6 +41,17 @@ public sealed unsafe class WinRing0Driver : IKernelDriver
     public bool IsOpen => _handle is { IsInvalid: false, IsClosed: false };
     public string? LastError { get; private set; }
 
+    /// <summary>
+    /// Opens only the already-running device. Never installs, starts, adopts, stops, or deletes a
+    /// driver service. Disposing this handle cannot change the service lifecycle.
+    /// </summary>
+    public static WinRing0Driver OpenExisting()
+    {
+        var driver = new WinRing0Driver();
+        if (driver.TryOpenDevice()) return driver;
+        throw new IOException($"The existing WinRing0 device could not be opened. No driver service action was attempted. {driver.LastError}");
+    }
+
     /// <summary>Opens the driver, installing it from the application directory if needed.</summary>
     public static WinRing0Driver Open()
     {
@@ -243,15 +254,18 @@ public sealed unsafe class WinRing0Driver : IKernelDriver
     // ------------------------------------------------------------- plumbing
     private bool Ioctl(uint code, void* input, uint inSize, void* output, uint outSize)
     {
-        if (!IsOpen) { LastError = "driver not open"; return false; }
+        if (!IsOpen) { LastError = "driver not open"; StartupIoDiagnostics.ObserveDriverNotIssued(code, outSize); return false; }
         lock (_ioLock)
         {
-            bool ok = Native.DeviceIoControl(_handle!, code, input, inSize, output, outSize, out _, IntPtr.Zero);
+            bool ok = Native.DeviceIoControl(_handle!, code, input, inSize, output, outSize, out uint returned, IntPtr.Zero);
+            int? observedError = null;
             if (!ok)
             {
                 int error = Marshal.GetLastWin32Error();
                 LastError = $"{new Win32Exception(error).Message} (Win32 {error})";
+                observedError = error;
             }
+            StartupIoDiagnostics.ObserveIoctlResult(code, outSize, ok, returned, observedError);
             return ok;
         }
     }

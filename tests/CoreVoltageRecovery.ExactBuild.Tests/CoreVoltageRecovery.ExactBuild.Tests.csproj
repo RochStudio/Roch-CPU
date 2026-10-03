@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PlatformTarget>x64</PlatformTarget>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="Roch CPU">
+      <HintPath>$(ExactCpuDll)</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Compile Include="../CoreVoltageRecovery.Model.Tests/Program.cs" Link="Program.cs" />
+    <Compile Include="../CorePageProbe.LowLevel.Tests/EcFakeDriver.cs" Link="EcFakeDriver.cs" />
+  </ItemGroup>
+  <Target Name="RequireExactCpuDll" BeforeTargets="ResolveReferences">
+    <Error Condition="'$(ExactCpuDll)' == '' or !Exists('$(ExactCpuDll)')" Text="Set ExactCpuDll to the verified local build's Roch CPU.dll. No production source is compiled or application entry point invoked by this test project." />
+  </Target>
+</Project>

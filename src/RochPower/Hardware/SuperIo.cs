@@ -48,6 +48,21 @@ public sealed class SuperIo : IDisposable
     public string Name { get; }
     public ushort BaseAddress => _base;
 
+    /// <summary>
+    /// Reuses an address/family already identified in the running tool's log. This performs no
+    /// configuration-port detection or SMBIOS access. Caller must supply verified existing facts.
+    /// </summary>
+    public static SuperIo ReuseVerifiedMsiEcAddress(IKernelDriver driver, ushort configurationPort,
+        ushort monitorBase, string chipName)
+    {
+        if (!driver.IsOpen) throw new IOException("An existing open driver handle is required.");
+        if (configurationPort is not (0x2E or 0x4E) || monitorBase < 0x100 || monitorBase > 0xFFF)
+            throw new ArgumentOutOfRangeException(nameof(monitorBase), "Verified MSI EC addresses are required.");
+        if (chipName is not ("Nuvoton NCT6683D" or "Nuvoton NCT6686D" or "Nuvoton NCT6687D"))
+            throw new ArgumentException("The verified device must be an MSI Nuvoton EC family.", nameof(chipName));
+        return new SuperIo(driver, configurationPort, monitorBase, SuperIoKind.NuvotonEc, chipName);
+    }
+
     /// <summary>Channel index carrying Vcore for this family.</summary>
     public int VcoreIndex => Kind switch { SuperIoKind.NuvotonEc => 2, _ => 0 };
 
@@ -287,6 +302,57 @@ public sealed class SuperIo : IDisposable
 
     /// <summary>Single raw EC-space read, for protocol diagnostics. Rate-limit the caller, not this.</summary>
     public byte ReadRaw(ushort address) => WithLock(() => ReadByteRaw(address), (byte)0);
+
+    /// <summary>Strict MSI EC access for a reviewed PAGE probe: failures never become zero data.</summary>
+    public byte ReadRawStrict(ushort address) => WithStrictEcLock(() =>
+    {
+        WaitForFreeEcPageStrict();
+        try
+        {
+            _drv.WriteIoPortByte((ushort)(_base + EC_PAGE), (byte)(address >> 8));
+            _drv.WriteIoPortByte((ushort)(_base + EC_INDEX), (byte)address);
+            return _drv.ReadIoPortByte((ushort)(_base + EC_DATA));
+        }
+        finally { _drv.WriteIoPortByte((ushort)(_base + EC_PAGE), EC_PAGE_FREE); }
+    });
+
+    public bool WriteRawStrict(ushort address, byte value) => WithStrictEcLock(() =>
+    {
+        WaitForFreeEcPageStrict();
+        try
+        {
+            _drv.WriteIoPortByte((ushort)(_base + EC_PAGE), (byte)(address >> 8));
+            _drv.WriteIoPortByte((ushort)(_base + EC_INDEX), (byte)address);
+            _drv.WriteIoPortByte((ushort)(_base + EC_DATA), value);
+            return true;
+        }
+        finally { _drv.WriteIoPortByte((ushort)(_base + EC_PAGE), EC_PAGE_FREE); }
+    });
+
+    private void WaitForFreeEcPageStrict()
+    {
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+        while (_drv.ReadIoPortByte((ushort)(_base + EC_PAGE)) != EC_PAGE_FREE)
+        {
+            if (timer.ElapsedMilliseconds >= 200) throw new IOException("MSI EC page/index interface remained busy; access refused.");
+            Thread.Sleep(1);
+        }
+    }
+
+    private T WithStrictEcLock<T>(Func<T> work)
+    {
+        if (Kind != SuperIoKind.NuvotonEc || _isaMutex == null)
+            throw new IOException("Strict access requires the verified MSI EC and its bus mutex.");
+        lock (_lock)
+        {
+            bool held;
+            try { held = _isaMutex.WaitOne(300); }
+            catch (AbandonedMutexException) { held = true; }
+            if (!held) throw new IOException("MSI EC bus mutex timed out; no port access attempted.");
+            try { return work(); }
+            finally { _isaMutex.ReleaseMutex(); }
+        }
+    }
 
     /// <summary>Single raw EC-space write. Only the vendor-command path uses this.</summary>
     public bool WriteRaw(ushort address, byte value) => WithLock(() =>

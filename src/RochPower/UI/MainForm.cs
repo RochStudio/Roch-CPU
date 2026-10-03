@@ -1,4 +1,3 @@
-using System.Globalization;
 using RochPower.Core;
 using RochPower.Hardware;
 
@@ -7,10 +6,18 @@ namespace RochPower.UI;
 public sealed class MainForm : Form
 {
     public const string AppName = "Roch CPU";
-    public const string AppVersion = "1.0.5";
+    public const string AppVersion = "1.0.6";
     private const int ResizeBorder = 6;
 
-    private readonly HardwareModel _hw = new();
+    private readonly bool _uiPreview;
+    private readonly bool _previewScrollBottom;
+    private readonly bool _previewSplitDimms;
+    private readonly bool _previewCoreReadFailed;
+    private readonly string? _previewVoltageReadings;
+    private readonly HardwareModel? _runtimeHardware;
+    // A preview never constructs HardwareModel (even its SMBIOS initializer probes the machine).
+    private HardwareModel _hw => _runtimeHardware ?? throw new InvalidOperationException("Hardware is unavailable in UI preview.");
+    private readonly IReadOnlyList<Setting> _previewSettings;
     private readonly LogForm _logForm = new();
 
     // Hardware-read identity shown above the tuning controls.
@@ -26,32 +33,51 @@ public sealed class MainForm : Form
     private readonly Button _btnLog = Theme.Button("Log");
     private readonly Button _btnTheme = Theme.TitleButton(Theme.GlyphTheme);
     private readonly Button _btnPerCore = Theme.Button("Per-Core Ratio Table");
-    private readonly Button _btnAuto = Theme.Button("Start");
-    private TextBox _txtAutoStep = null!, _txtAutoInterval = null!;
-    private TableLayoutPanel _toolRow = null!;
-    private FlowLayoutPanel _autoPanel = null!;
 
     // rows
     private readonly TableLayoutPanel _rows = new() { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 1, BackColor = Theme.Bg };
+    private readonly Panel _rowsViewport = new() { Dock = DockStyle.Fill, AutoScroll = true, Margin = new Padding(0) };
     private readonly Dictionary<Setting, TextBox> _boxes = new();
     private readonly Dictionary<Setting, Label> _statusLabels = new();
     private readonly Dictionary<Setting, Label> _rangeLabels = new();
     /// <summary>When each row last showed an apply result in its range label, so the live reading leaves it up for a while.</summary>
     private readonly Dictionary<Setting, DateTime> _rowResults = new();
-    private Label? _coreVoltageComparison;
+    private MemoryVoltageLink? _memoryLink;
+    private RadioButton? _splitDimms, _syncDimms;
+    private readonly Dictionary<string, Label> _memoryGroupLabels = new();
+    private readonly Dictionary<string, TextBox> _sharedMemoryBoxes = new();
+    private readonly Dictionary<string, Control> _sharedMemoryRows = new();
+    private readonly Dictionary<Setting, Control> _memoryPerDimmRows = new();
+    private readonly Dictionary<string, string> _settingDrafts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _sharedDraftTexts = new();
+    private readonly HashSet<string> _pendingSharedMemoryEdits = new();
+    private readonly HashSet<Setting> _pendingMemoryEdits = new();
+    private bool _stagingMemory;
+    private bool _projectingShared;
 
     private readonly Button _btnApply = Theme.Button("Apply", primary: true);
-    private readonly Button _btnReset = Theme.Button("Reset");
-    private readonly Label _lblStatus = Theme.Label("", Theme.Small, Theme.Muted);
+    private readonly Button _btnReset = Theme.Button("Reset to Default");
+    private readonly Label _lblStatus = Theme.Label("", Theme.Small, Theme.Text);
 
-    private readonly System.Windows.Forms.Timer _autoTimer = new();
     private readonly System.Windows.Forms.Timer _slowRefresh = new() { Interval = 3000 };
     private bool _bclkBusy;
     /// <summary>Set while an apply is running on a worker, so nothing else touches the hardware.</summary>
     private bool _applying;
 
-    public MainForm()
+    public MainForm() : this(uiPreview: false) { }
+
+    public static MainForm CreateUiPreview(bool scrollBottom = false, bool verifiedCore = false, bool splitDimms = false, bool coreReadFailed = false, string? voltageReadings = null) => new(uiPreview: true, previewScrollBottom: scrollBottom, previewVerifiedCore: verifiedCore, previewSplitDimms: splitDimms, previewCoreReadFailed: coreReadFailed, previewVoltageReadings: voltageReadings);
+
+    private MainForm(bool uiPreview, bool previewScrollBottom = false, bool previewVerifiedCore = false, bool previewSplitDimms = false, bool previewCoreReadFailed = false, string? previewVoltageReadings = null)
     {
+        _uiPreview = uiPreview;
+        _previewScrollBottom = uiPreview && previewScrollBottom;
+        _previewSplitDimms = uiPreview && previewSplitDimms;
+        _previewCoreReadFailed = uiPreview && (previewCoreReadFailed || previewVoltageReadings == "error");
+        _previewVoltageReadings = uiPreview ? previewVoltageReadings : null;
+        _previewSettings = uiPreview ? UiPreviewSettings.Create(previewVerifiedCore, _previewCoreReadFailed) : Array.Empty<Setting>();
+        if (uiPreview) ConfigureVoltageReadingsFixture();
+        _runtimeHardware = uiPreview ? null : new HardwareModel();
         Text = AppName;
         Icon = Theme.LoadAppIcon();
         Font = Theme.Base;
@@ -63,10 +89,12 @@ public sealed class MainForm : Form
         Size = new Size(500, 760);
         KeyPreview = true;
         DoubleBuffered = true;
+        AutoScaleDimensions = new SizeF(96, 96);
+        AutoScaleMode = AutoScaleMode.Dpi;
 
         BuildLayout();
-        _hw.Log += AppendLog;
-        Load += OnLoad;
+        if (_runtimeHardware != null) _runtimeHardware.Log += AppendLog;
+        Load += uiPreview ? OnPreviewLoad : OnLoad;
         FormClosing += OnClosing;
         KeyDown += OnKeyDown;
     }
@@ -76,20 +104,20 @@ public sealed class MainForm : Form
 
     private void BuildLayout()
     {
-        var outer = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, BackColor = Theme.Bg, Margin = new Padding(0), Padding = new Padding(1) };
+        var outer = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, BackColor = Theme.Bg, Margin = new Padding(0), Padding = new Padding(1) };
         outer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         outer.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
         outer.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        outer.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));
         Controls.Add(outer);
 
         // ---- title bar ----
         var title = new Panel { Dock = DockStyle.Fill, BackColor = Theme.TitleBar, Margin = new Padding(0) };
         var brand = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, Location = new Point(8, 0), Height = 30, BackColor = Color.Transparent };
-        var mark = Theme.LoadMark(20);
-        if (mark != null) brand.Controls.Add(new PictureBox { Image = mark, Size = new Size(20, 20), Margin = new Padding(0, 5, 6, 0), BackColor = Color.Transparent });
-        var roch = Theme.Label("Roch", Theme.Brand, Theme.Text); roch.Margin = new Padding(0, 6, 0, 0);
-        var cpu = Theme.Label($"CPU {AppVersion}", Theme.Brand, Theme.Text); cpu.Margin = new Padding(4, 6, 0, 0);
-        brand.Controls.Add(roch); brand.Controls.Add(cpu);
+        var mark = Theme.LoadMark(24);
+        if (mark != null) brand.Controls.Add(new PictureBox { Image = mark, Size = new Size(24, 24), Margin = new Padding(0, 3, 6, 0), BackColor = Color.Transparent });
+        var appTitle = Theme.Label($"{AppName} {AppVersion}", Theme.Brand, Theme.Text); appTitle.Margin = new Padding(0, 7, 0, 0);
+        brand.Controls.Add(appTitle);
         title.Controls.Add(brand);
         var btnClose = Theme.TitleButton(Theme.GlyphClose, close: true);
         var btnMin = Theme.TitleButton(Theme.GlyphMinimise);
@@ -103,10 +131,11 @@ public sealed class MainForm : Form
             _resultTip.SetToolTip(_btnTheme, ThemeTip());
         };
         _resultTip.SetToolTip(_btnTheme, ThemeTip());
-        var tb = new FlowLayoutPanel { FlowDirection = FlowDirection.RightToLeft, Dock = DockStyle.Right, Width = 132, BackColor = Color.Transparent, Margin = new Padding(0) };
+        _btnTheme.Width = 36;
+        var tb = new FlowLayoutPanel { FlowDirection = FlowDirection.RightToLeft, Dock = DockStyle.Right, Width = 124, BackColor = Color.Transparent, Margin = new Padding(0) };
         tb.Controls.Add(btnClose); tb.Controls.Add(btnMin); tb.Controls.Add(_btnTheme);
         title.Controls.Add(tb);
-        foreach (Control c in new Control[] { title, brand, roch, cpu }) Theme.EnableDrag(c, this);
+        foreach (Control c in new Control[] { title, brand, appTitle }) Theme.EnableDrag(c, this);
         foreach (Control c in brand.Controls) Theme.EnableDrag(c, this);
         outer.Controls.Add(title, 0, 0);
 
@@ -117,7 +146,6 @@ public sealed class MainForm : Form
         _body.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // tools
         _body.RowStyles.Add(new RowStyle(SizeType.Percent, 100)); // rows
         _body.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // apply
-        _body.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // status
         outer.Controls.Add(_body, 0, 1);
 
         // Header: CPU, topology, microcode, board and BIOS. Log button top right.
@@ -127,7 +155,7 @@ public sealed class MainForm : Form
         _btnLog.Font = Theme.Small; _btnLog.AutoSize = false; _btnLog.Width = 48; _btnLog.Height = 24; _btnLog.Padding = new Padding(0); _btnLog.Margin = new Padding(0, 2, 0, 0);
         _btnLog.Click += (_, _) => ToggleLog();
         header.Controls.Add(_lblCpu, 0, 0);
-        var headerButtons = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, Margin = new Padding(0) };
+        var headerButtons = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, Margin = new Padding(0), BackColor = Theme.Bg };
         _btnLog.Width = 64;
         headerButtons.Controls.Add(_btnLog);
         header.Controls.Add(headerButtons, 1, 0);
@@ -150,31 +178,21 @@ public sealed class MainForm : Form
         header.SetColumnSpan(_lblWarn, 2);
         _body.Controls.Add(header, 0, 0);
 
-        // tools: per-core table + auto ratio stepper
-        var toolRow = _toolRow = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = false, Height = 72, ColumnCount = 1, RowCount = 2, BackColor = Theme.Bg, Margin = new Padding(0, 4, 0, 2) };
+        // Manual per-core controls remain; automatic ratio stepping has been removed.
+        var toolRow = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = false, Height = 36, ColumnCount = 1, RowCount = 1, BackColor = Theme.Bg, Margin = new Padding(0, 4, 0, 2) };
         toolRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         toolRow.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
-        toolRow.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
         _btnPerCore.Dock = DockStyle.Top; _btnPerCore.AutoSize = false; _btnPerCore.Height = 30; _btnPerCore.Font = Theme.Bold; _btnPerCore.Margin = new Padding(0, 0, 0, 6);
         _btnPerCore.Click += (_, _) => OpenPerCore();
         toolRow.Controls.Add(_btnPerCore, 0, 0);
-        var auto = _autoPanel = new FlowLayoutPanel { AutoSize = false, Height = 32, Dock = DockStyle.Top, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, BackColor = Color.Transparent, Margin = new Padding(0) };
-        var autoLbl = Theme.Label("Auto ratio step", Theme.Row); autoLbl.Margin = new Padding(0, 4, 8, 0);
-        auto.Controls.Add(autoLbl);
-        auto.Controls.Add(Theme.ValueBox(out _txtAutoStep, 44)); _txtAutoStep.Text = "1";
-        var every = Theme.Muted_("every"); every.Margin = new Padding(6, 5, 0, 0); auto.Controls.Add(every);
-        auto.Controls.Add(Theme.ValueBox(out _txtAutoInterval, 44)); _txtAutoInterval.Text = "5";
-        var sec = Theme.Muted_("s"); sec.Margin = new Padding(4, 5, 8, 0); auto.Controls.Add(sec);
-        _btnAuto.Margin = new Padding(0, 0, 0, 0); _btnAuto.AutoSize = false; _btnAuto.Padding = new Padding(0); _btnAuto.Width = 70; _btnAuto.Height = 26;
-        _btnAuto.Click += (_, _) => ToggleAuto();
-        auto.Controls.Add(_btnAuto);
-        toolRow.Controls.Add(auto, 0, 1);
         _body.Controls.Add(toolRow, 0, 1);
 
-        // rows: no scroller, the window is sized to hold them
+        // Only the setting rows scroll; header, actions and footer remain reachable on smaller displays.
         _rows.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         _rows.Margin = new Padding(0, 2, 0, 0);
-        _body.Controls.Add(_rows, 0, 2);
+        _rowsViewport.BackColor = Theme.Bg;
+        _rowsViewport.Controls.Add(_rows);
+        _body.Controls.Add(_rowsViewport, 0, 2);
 
         // Apply / reset. Refresh-from-hardware remains automatic for live read-only rows.
         var applyRow = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 2, BackColor = Theme.Bg, Margin = new Padding(0, 4, 0, 0) };
@@ -186,70 +204,83 @@ public sealed class MainForm : Form
         _btnApply.Height = _btnReset.Height = 32;
         _btnApply.Click += (_, _) => ApplyAll();
         _btnReset.Click += (_, _) => RestoreDefaults();
+        _resultTip.SetToolTip(_btnReset, "Reset changed available writable settings using their recorded startup values or per-control Auto/default actions; discard staged drafts. AMD power limits use CPU stock defaults and Curve Optimizer returns to zero. This does not reset factory BIOS settings.");
         applyRow.Controls.Add(_btnApply, 0, 0);
         applyRow.Controls.Add(_btnReset, 1, 0);
         _body.Controls.Add(applyRow, 0, 3);
 
-        // status
-        // A plain top-down stack: the two-column table this used to be reserved a blank line under the links.
-        var status = new FlowLayoutPanel
+        // Viewer-style footer: social links left, existing status right.
+        var status = new TableLayoutPanel
         {
-            Dock = DockStyle.Fill, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, FlowDirection = FlowDirection.TopDown,
-            WrapContents = false, BackColor = Theme.Bg, Margin = new Padding(0, 6, 0, 0)
+            Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Padding = new Padding(10, 0, 10, 0),
+            BackColor = Theme.Bg, Margin = new Padding(0)
         };
-        _lblStatus.AutoSize = true;
+        status.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        status.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        _lblStatus.AutoSize = false;
+        _lblStatus.Dock = DockStyle.Fill;
+        _lblStatus.TextAlign = ContentAlignment.MiddleRight;
+        _lblStatus.AutoEllipsis = true;
         _lblStatus.Margin = new Padding(0);
-        status.Controls.Add(_lblStatus);
         // Roch Viewer's footer handle: brand red, bold, no underline, and colour is the whole
         // affordance - there is no button edge, so it lifts a shade under the pointer.
         var author = new LinkLabel
         {
-            Text = "YouTube | X | Discord", ForeColor = Theme.Text, LinkColor = Theme.Accent, ActiveLinkColor = Theme.Warn, VisitedLinkColor = Theme.Accent,
+            Text = "YouTube | X | Discord", ForeColor = Theme.Text, LinkColor = Theme.Selected, ActiveLinkColor = Theme.Hover, VisitedLinkColor = Theme.Selected,
             LinkBehavior = LinkBehavior.NeverUnderline, Font = Theme.Bold, AutoSize = true,
-            BackColor = Color.Transparent, Cursor = Cursors.Hand, Margin = new Padding(0, 5, 0, 0)
+            BackColor = Color.Transparent, Cursor = _uiPreview ? Cursors.Default : Cursors.Hand, Margin = new Padding(0, 5, 6, 0)
         };
         author.Links.Clear();
         author.Links.Add(0, 7, "https://www.youtube.com/@MateoPcTech");
         author.Links.Add(10, 1, Theme.AuthorUrl);
         author.Links.Add(14, 7, "https://discord.gg/KfzExpKQHB");
-        author.LinkClicked += (_, e) => { try { if (e.Link?.LinkData is string url) System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(url) { UseShellExecute = true }); } catch { } };
-        author.MouseEnter += (_, _) => author.LinkColor = Theme.Warn;
-        author.MouseLeave += (_, _) => author.LinkColor = Theme.Accent;
-        status.Controls.Add(author);
-        _body.Controls.Add(status, 0, 4);
+        author.LinkClicked += (_, e) => { if (_uiPreview) return; try { if (e.Link?.LinkData is string url) System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(url) { UseShellExecute = true }); } catch { } };
+        author.MouseEnter += (_, _) => author.LinkColor = Theme.Hover;
+        author.MouseLeave += (_, _) => author.LinkColor = Theme.Selected;
+        status.Controls.Add(author, 0, 0);
+        status.Controls.Add(_lblStatus, 1, 0);
+        outer.Controls.Add(status, 0, 2);
 
         Resize += (_, _) =>
         {
-            int w = Math.Max(240, ClientSize.Width - 90);
-            _lblStatus.MaximumSize = new Size(w, 0);
             foreach (var l in new[] { _lblCpu, _lblCores, _lblMicrocode, _lblBoard, _lblAgesa, _lblBios, _lblWarn }) l.MaximumSize = new Size(ClientSize.Width - 80, 0);
         };
+
     }
 
-    /// <summary>One compact line per setting: name, allowed range, value box. Nothing scrolls.</summary>
+    /// <summary>One compact line per available setting; every row remains accessible through the viewport.</summary>
     private void BuildRows()
     {
+        bool synced = _memoryLink?.IsSynced ?? !_previewSplitDimms;
+        var pendingIds = _pendingMemoryEdits.Select(s => s.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
         _rows.SuspendLayout();
         foreach (Control old in _rows.Controls.Cast<Control>().ToArray()) old.Dispose();
         _rows.Controls.Clear();
         _rows.RowStyles.Clear();
         _boxes.Clear(); _statusLabels.Clear(); _rangeLabels.Clear(); _rowResults.Clear();
-        _coreVoltageComparison = null;
+        _pendingMemoryEdits.Clear(); _memoryGroupLabels.Clear();
+        _sharedMemoryBoxes.Clear(); _sharedMemoryRows.Clear(); _memoryPerDimmRows.Clear();
+        var settings = (_uiPreview ? _previewSettings : _hw.Settings).ToArray();
+        _memoryLink = CreateMemoryLink(settings);
+        _memoryLink.SetSynced(synced);
         SettingGroup? last = null;
         TableLayoutPanel? section = null;
-        foreach (var s in _hw.Settings)
+        int sectionRow = 0;
+        foreach (var s in settings)
         {
-            // Unavailable rows are hidden rather than shown greyed out: it keeps everything on screen
-            // without scrolling, and a control this system does not have is not worth a line.
-            if (!s.Available) continue;
+            // Keep the core target visible when its existing verification gate refuses access.
+            // Its target is not the measured Vcore or VID, and no value is read through that gate.
+            bool unavailableCore = s.Id == "core_v" && !s.Available;
+            if (!s.Available && !unavailableCore) continue;
 
             if (s.Group != last)
             {
                 last = s.Group;
+                sectionRow = 0;
                 section = new TableLayoutPanel
                 {
                     AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                    ColumnCount = 1, Dock = DockStyle.Top, BackColor = Theme.Bg,
+                    ColumnCount = 1, Dock = DockStyle.Top, BackColor = Theme.Panel,
                     Padding = new Padding(10, 3, 10, 4), Margin = new Padding(0, 0, 0, 6)
                 };
                 section.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -265,17 +296,18 @@ public sealed class MainForm : Form
                     SettingGroup.Power => "Power",
                     SettingGroup.Pbo => "Precision Boost",
                     SettingGroup.Memory => "Memory",
-                    SettingGroup.Board => "Board VRM rails (measured)", _ => ""
+                    SettingGroup.Board => "Board VRM rails", _ => ""
                 });
                 heading.Margin = new Padding(0, 0, 0, 2);
                 section.Controls.Add(heading);
                 section.Controls.Add(Theme.Rule());
-                if (s.Group == SettingGroup.Power && _hw.IsAmd && !PawnIo.IsInstalled) section.Controls.Add(PawnIoNote());
+                if (s.Group == SettingGroup.Memory) AddMemoryLinkControls(section);
+                if (!_uiPreview && s.Group == SettingGroup.Power && _hw.IsAmd && !PawnIo.IsInstalled) section.Controls.Add(PawnIoNote());
                 _rows.Controls.Add(section);
             }
 
             // Alternating row shading, the way Roch Viewer's tables read.
-            var rowBack = Theme.Bg;
+            var rowBack = sectionRow++ % 2 == 0 ? Theme.Panel : Theme.PanelAlt;
             var row = new TableLayoutPanel { AutoSize = true, ColumnCount = 4, Dock = DockStyle.Top, BackColor = rowBack, Margin = new Padding(0) };
             row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 180));
             row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 84));
@@ -285,17 +317,19 @@ public sealed class MainForm : Form
             var displayName = s.Name.Replace(" (Package Power Tracking)", "").Replace(" (Thermal Design Current)", "")
                 .Replace(" (Electrical Design Current)", "").Replace(" (Tctl max)", "")
                 .Replace(" (all cores)", "").Replace("DRAM ", "").Replace(" Voltage", "");
+            if (s.Id == "core_v") displayName = "CPU Core Voltage";
             var name = Theme.Label(displayName, Theme.Row, Theme.Text);
             if (s.Group == SettingGroup.Memory && !displayName.Contains("VDDQ") && !displayName.Contains("VPP")) name.Text += " VDD";
             name.MaximumSize = new Size(175, 0);
             name.Margin = new Padding(6, 4, 0, 3);
-            var range = Theme.Muted_(IdleText(s));
+            var range = Theme.Label(unavailableCore ? "unavailable" : IdleText(s), Theme.Small, s.ReadOnly || unavailableCore ? Theme.Muted : Theme.Text);
             range.Margin = new Padding(8, 5, 8, 0);
             range.TextAlign = ContentAlignment.MiddleRight;
             var frame = Theme.ValueBox(out var box, 76);
             frame.Margin = new Padding(0, 1, 0, 1);
-            box.Text = s.CurrentText;
-            box.Enabled = !s.ReadOnly;
+            box.Text = unavailableCore ? "Not read" : _settingDrafts.GetValueOrDefault(s.Id, CoreDisplayText(s));
+            box.Enabled = s.Available && !s.ReadOnly;
+            box.ReadOnly = _uiPreview;
             box.Tag = s;
             var unit = Theme.Muted_(s.Unit); unit.Margin = new Padding(4, 5, 0, 0); unit.Width = 34; unit.AutoSize = false;
 
@@ -306,20 +340,235 @@ public sealed class MainForm : Form
             row.Controls.Add(range, 3, 0);
             if (RowTip(s) is { } tipText) { var tip = new ToolTip { AutoPopDelay = 20000 }; tip.SetToolTip(name, tipText); tip.SetToolTip(box, tipText); tip.SetToolTip(range, tipText); }
             section!.Controls.Add(row);
-            if (s.Id == "core_v" && _hw.AsusControl != null)
+            if (unavailableCore)
             {
-                _coreVoltageComparison = Theme.Muted_("Measured Vcore: waiting for sensor");
-                _coreVoltageComparison.Margin = new Padding(6, 0, 6, 5);
-                _coreVoltageComparison.Dock = DockStyle.Top;
-                _resultTip.SetToolTip(_coreVoltageComparison,
-                    "Live ASUS Vcore sensor. Difference is relative to the applied target, not an unsaved edit. " +
-                    "Sensor samples and load change over time; this is not a fixed calibration offset.");
-                section.Controls.Add(_coreVoltageComparison);
+                string detail = _uiPreview ? "Fixture: automatic startup core-page check failed; no voltage or mode target changed." :
+                    _hw.VoltageAccessRestriction ?? (_hw.CoreVoltageStatus != "not probed" ? _hw.CoreVoltageStatus : s.Note ?? "Core target is unavailable; see Log for the existing access checks.");
+                var reason = Theme.Label("Core voltage unavailable - see Log", Theme.Small, Theme.Warn);
+                reason.Margin = new Padding(6, 0, 6, 4);
+                reason.MaximumSize = new Size(420, 0);
+                _resultTip.SetToolTip(reason, detail);
+                _resultTip.SetToolTip(box, detail);
+                _resultTip.SetToolTip(name, detail);
+                _resultTip.SetToolTip(range, detail);
+                section.Controls.Add(reason);
             }
             _boxes[s] = box; _statusLabels[s] = range; _rangeLabels[s] = range;
+            _settingDrafts[s.Id] = box.Text;
+            box.TextChanged += (_, _) => _settingDrafts[s.Id] = box.Text;
+            if (MemoryVoltageLink.TryGetRail(s, out _))
+            {
+                _memoryPerDimmRows[s] = row;
+                if (pendingIds.Contains(s.Id)) _pendingMemoryEdits.Add(s);
+                box.TextChanged += (_, _) =>
+                {
+                    if (!_stagingMemory && !_applying && box.Focused && _memoryLink?.IsSynced == true)
+                        _pendingMemoryEdits.Add(s);
+                    UpdateMemoryGroupLabels();
+                };
+                box.Leave += (_, _) =>
+                {
+                    if (!_applying && _memoryLink?.IsSynced == true && _pendingMemoryEdits.Contains(s))
+                        StageMemoryDraft(s);
+                };
+            }
         }
+        UpdateMemoryGroupLabels();
         _rows.ResumeLayout();
     }
+
+    private MemoryVoltageLink CreateMemoryLink(IReadOnlyList<Setting> settings)
+    {
+        var grids = new Dictionary<string, MemoryVoltageGrid>(StringComparer.OrdinalIgnoreCase);
+        if (_uiPreview)
+        {
+            foreach (var s in settings)
+                if (MemoryVoltageLink.TryGetRail(s, out string rail))
+                {
+                    int step = _previewVoltageReadings == "error" && s.Id == "dimmb1_vddq" ? 0 : rail == "VPP" ? 5 : 10;
+                    grids[s.Id] = new(rail == "VPP" ? 1500 : 800, step);
+                }
+        }
+        else
+        {
+            // These are the cached results of existing capability detection, not new reads.
+            foreach (var dimm in _hw.Dimms)
+            {
+                string id = dimm.SlotName.ToLowerInvariant();
+                grids[id + "_vdd"] = new(800, dimm.VddStepMv);
+                grids[id + "_vddq"] = new(800, dimm.VddqStepMv);
+                grids[id + "_vpp"] = new(1500, dimm.VppVerified ? 5 : 0);
+            }
+        }
+        return new(settings, grids);
+    }
+
+    private void AddMemoryLinkControls(TableLayoutPanel section)
+    {
+        var modes = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Top, WrapContents = false, BackColor = Theme.Panel, Margin = new Padding(6, 2, 0, 2) };
+        bool synced = _memoryLink!.IsSynced;
+        _splitDimms = new RadioButton { Text = "Split DIMMs", AutoSize = true, Checked = !synced, FlatStyle = FlatStyle.Flat, Font = Theme.Base, ForeColor = synced ? Theme.Text : Theme.Selected, BackColor = Theme.Panel, Margin = new Padding(0, 0, 18, 0) };
+        _syncDimms = new RadioButton { Text = "Sync DIMMs", AutoSize = true, Checked = synced, FlatStyle = FlatStyle.Flat, Font = Theme.Base, ForeColor = synced ? Theme.Selected : Theme.Text, BackColor = Theme.Panel, Margin = new Padding(0) };
+        _splitDimms.CheckedChanged += (_, _) => _splitDimms.ForeColor = _splitDimms.Checked ? Theme.Selected : Theme.Text;
+        _syncDimms.CheckedChanged += (_, _) => _syncDimms.ForeColor = _syncDimms.Checked ? Theme.Selected : Theme.Text;
+        modes.Controls.Add(_splitDimms); modes.Controls.Add(_syncDimms);
+        _syncDimms.CheckedChanged += (_, _) =>
+        {
+            _memoryLink!.SetSynced(_syncDimms.Checked);
+            // Changing mode only changes the projection; drafts and pending shared text survive.
+            UpdateMemoryGroupLabels();
+        };
+        section.Controls.Add(modes);
+        var hint = Theme.Label("PMIC targets; same rail only; staged until Apply.", Theme.Small, Theme.Text);
+        hint.Margin = new Padding(6, 0, 0, 3);
+        section.Controls.Add(hint);
+        foreach (string rail in new[] { "VDD", "VDDQ", "VPP" })
+        {
+            var row = new TableLayoutPanel { AutoSize = true, ColumnCount = 4, Dock = DockStyle.Top, BackColor = Theme.Panel, Margin = new Padding(0) };
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 180));
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 84));
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 40));
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            var name = Theme.Label(rail, Theme.Row, Theme.Text); name.Margin = new Padding(6, 4, 0, 3);
+            var frame = Theme.ValueBox(out var box, 76); frame.Margin = new Padding(0, 1, 0, 1);
+            box.ReadOnly = _uiPreview;
+            var unit = Theme.Muted_("V"); unit.Margin = new Padding(4, 5, 0, 0);
+            row.Controls.Add(name, 0, 0); row.Controls.Add(frame, 1, 0); row.Controls.Add(unit, 2, 0);
+            var summary = Theme.Label("", Theme.Small, Theme.Text);
+            summary.MaximumSize = new Size(420, 0); summary.Margin = new Padding(6, 0, 0, 2);
+            _memoryGroupLabels[rail] = summary;
+            row.Controls.Add(summary, 0, 1); row.SetColumnSpan(summary, 4);
+            _sharedMemoryBoxes[rail] = box; _sharedMemoryRows[rail] = row;
+            box.TextChanged += (_, _) =>
+            {
+                if (_projectingShared || _applying || !box.Focused) return;
+                _sharedDraftTexts[rail] = box.Text;
+                _pendingSharedMemoryEdits.Add(rail);
+            };
+            box.Leave += (_, _) =>
+            {
+                if (!_applying && _memoryLink?.IsSynced == true && _pendingSharedMemoryEdits.Contains(rail))
+                    StageSharedMemoryDraft(rail);
+            };
+            section.Controls.Add(row);
+        }
+    }
+
+    private void UpdateMemoryGroupLabels()
+    {
+        if (_memoryLink == null) return;
+        foreach (var row in _memoryPerDimmRows.Values) row.Visible = !_memoryLink.IsSynced;
+        foreach (var row in _sharedMemoryRows.Values) row.Visible = _memoryLink.IsSynced;
+        foreach (var (rail, label) in _memoryGroupLabels)
+        {
+            var source = _boxes.Keys.FirstOrDefault(s => MemoryVoltageLink.TryGetRail(s, out string r) && r == rail);
+            var group = source == null ? null : _memoryLink.GetGroup(source);
+            var box = _sharedMemoryBoxes[rail];
+            if (group == null) { label.Visible = true; label.Text = "No detected rail"; label.ForeColor = Theme.Muted; box.Enabled = false; continue; }
+            var display = _memoryLink.GetDisplay(group, DraftTargets());
+            _projectingShared = true;
+            try
+            {
+                box.Enabled = display.CanEdit;
+                box.Text = _sharedDraftTexts.GetValueOrDefault(rail, display.Text);
+                box.ForeColor = display.IsMixed && !_sharedDraftTexts.ContainsKey(rail) ? Theme.Muted : box.Enabled ? Theme.Accent : Theme.Muted;
+            }
+            finally { _projectingShared = false; }
+            if (!group.CanSync)
+            {
+                label.Visible = true;
+                label.Text = "Sync unavailable - use Split DIMMs";
+                label.ForeColor = Theme.Warn;
+                _resultTip.SetToolTip(label, group.Reason);
+                _resultTip.SetToolTip(box, group.Reason);
+                continue;
+            }
+            // Hide the allowed range/step hint and its layout space; validation still uses
+            // the exact same capability intersection and PMIC grids before staging/Apply.
+            label.Text = "";
+            label.Visible = false;
+            label.ForeColor = Theme.Text;
+            _resultTip.SetToolTip(label, "Supported targets across detected DIMMs. Mixed targets remain unchanged until you edit this rail. Auto/0 requires Split DIMMs.");
+            _resultTip.SetToolTip(box, "A shared staged target for this rail. Mixed means the DIMM setpoints or drafts differ; no value is chosen automatically.");
+        }
+    }
+
+    /// <summary>Inert target-state fixtures retained for UI QA; no sensor objects or callbacks are used.</summary>
+    private void ConfigureVoltageReadingsFixture()
+    {
+        if (_previewVoltageReadings == "auto-mixed")
+            foreach (var setting in _previewSettings.Where(s => s.Id == "core_v" || s.Group == SettingGroup.Memory))
+                setting.Current = null;
+    }
+
+    private bool StageSharedMemoryDraft(string rail)
+    {
+        if (_memoryLink?.IsSynced != true || !_sharedMemoryBoxes.TryGetValue(rail, out var box)) return true;
+        var source = _boxes.Keys.FirstOrDefault(s => MemoryVoltageLink.TryGetRail(s, out string r) && r == rail);
+        if (source == null) return false;
+        if (!_memoryLink.TryStage(source, box.Text, out var updates, out string? error))
+        {
+            _sharedDraftTexts[rail] = box.Text;
+            _pendingSharedMemoryEdits.Add(rail);
+            SetStatus(error ?? "DIMM targets could not be linked.", true);
+            return false;
+        }
+        _stagingMemory = true;
+        try
+        {
+            foreach (var (setting, text) in updates)
+            {
+                _settingDrafts[setting.Id] = text;
+                if (_boxes.TryGetValue(setting, out var peer)) peer.Text = text;
+                _pendingMemoryEdits.Remove(setting);
+            }
+            _sharedDraftTexts.Remove(rail); _pendingSharedMemoryEdits.Remove(rail);
+        }
+        finally { _stagingMemory = false; }
+        UpdateMemoryGroupLabels();
+        return true;
+    }
+
+    private bool StageMemoryDraft(Setting source)
+    {
+        if (_memoryLink?.IsSynced != true || !_boxes.TryGetValue(source, out var box)) return true;
+        if (!_memoryLink.TryStage(source, box.Text, out var updates, out string? error))
+        {
+            SetRowStatus(source, "invalid Sync target", Theme.Danger);
+            SetStatus(error ?? "DIMM targets could not be linked.", true);
+            return false;
+        }
+        _stagingMemory = true;
+        try
+        {
+            foreach (var (setting, text) in updates)
+            {
+                if (_boxes.TryGetValue(setting, out var peer)) peer.Text = text;
+                _pendingMemoryEdits.Remove(setting);
+                SetRowStatus(setting, "staged", Theme.Text);
+            }
+        }
+        finally { _stagingMemory = false; }
+        UpdateMemoryGroupLabels();
+        return true;
+    }
+
+    private bool PrepareMemoryForApply(out string? error)
+    {
+        error = null;
+        if (_memoryLink?.IsSynced != true) return true;
+        foreach (string rail in _pendingSharedMemoryEdits.ToArray())
+            if (!StageSharedMemoryDraft(rail)) { error = _lblStatus.Text; return false; }
+        // Enter can request Apply while the edited textbox still has focus.
+        var focused = _boxes.FirstOrDefault(pair => pair.Value.Focused && _pendingMemoryEdits.Contains(pair.Key));
+        if (focused.Key != null && !StageMemoryDraft(focused.Key)) { error = _lblStatus.Text; return false; }
+        return _memoryLink.ValidateForApply(DraftTargets(), out error);
+    }
+
+    private string DraftText(Setting setting) => _settingDrafts.GetValueOrDefault(setting.Id,
+        _boxes.TryGetValue(setting, out var box) ? box.Text : setting.CurrentText);
+
+    private IReadOnlyDictionary<Setting, string> DraftTargets() => _boxes.Keys.ToDictionary(setting => setting, DraftText);
 
     /// <summary>The right-hand column when there is no live reading or apply result to show.</summary>
     private static string IdleText(Setting s) => s.ReadOnly ? "read-only" : "";
@@ -349,11 +598,13 @@ public sealed class MainForm : Form
         return note;
     }
 
-    /// <summary>Grow the window to whatever the rows need, so there is never a scrollbar.</summary>
+    /// <summary>Use natural content height within the work area; overflow stays in the settings viewport.</summary>
     private void FitToContent()
     {
         _body.PerformLayout();
-        int needed = _body.PreferredSize.Height + 30 /* title bar */ + 2 /* 1 px border */;
+        int needed = _rows.PreferredSize.Height + _body.Padding.Vertical + _rows.Margin.Vertical
+            + _body.Controls.Cast<Control>().Where(c => c != _rowsViewport).Sum(c => c.PreferredSize.Height + c.Margin.Vertical)
+            + (int)Math.Ceiling(54 * DeviceDpi / 96.0) + 2;
         var work = Screen.FromControl(this).WorkingArea;
         int height = Math.Min(needed, work.Height - 40);
         Height = Math.Max(MinimumSize.Height, height);
@@ -382,6 +633,36 @@ public sealed class MainForm : Form
     }
 
     // ------------------------------------------------------------------ lifecycle
+    private void OnPreviewLoad(object? sender, EventArgs e)
+    {
+        Text = AppName + " - UI preview";
+        _lblCpu.Text = "CPU: Fixture - Intel Core i5-14600KF";
+        _lblCores.Text = "Cores / Threads: 6 / 12";
+        _lblMicrocode.Text = "Microcode: 0x11F (fixture)";
+        _lblBoard.Text = "Motherboard: Z790MPOWER (fixture)";
+        _lblAgesa.Visible = false;
+        _lblBios.Text = "BIOS: P.A0 (fixture)";
+        _lblLive.Text = "Fixture: P x54 E x? Ring x50 | VID 1.270 V | " + (_previewVoltageReadings == "error" ? "Vcore unavailable" : "Vcore 1.276 V");
+        _lblWarn.Text = "UI PREVIEW - fixed fixture values; no hardware access or changes.";
+        _lblWarn.Visible = true;
+        _btnApply.Enabled = _btnReset.Enabled = _btnPerCore.Enabled = false;
+        BuildRows();
+        SetStatus("UI preview - no hardware access", false);
+        AppendLog("UI preview: hardware model, drivers and refresh timers are not initialized.");
+        FitToContent();
+        BeginInvoke(() =>
+        {
+            ActiveControl = null;
+            // Fixture-only layout aid: expose the final memory row without changing values,
+            // starting refresh timers, invoking hardware callbacks or saving preferences.
+            if (_previewScrollBottom)
+            {
+                Control? last = _memoryLink?.IsSynced == true ? _sharedMemoryRows.GetValueOrDefault("VPP") : _memoryPerDimmRows.GetValueOrDefault(_previewSettings[^1]);
+                if (last != null) _rowsViewport.ScrollControlIntoView(last);
+            }
+        });
+    }
+
     private void OnLoad(object? sender, EventArgs e)
     {
         AppendLog($"{AppName} {AppVersion} starting from {AppContext.BaseDirectory}");
@@ -433,16 +714,12 @@ public sealed class MainForm : Form
         {
             _btnPerCore.Text = "Curve Optimizer (per core)";
             _btnPerCore.Enabled = _hw.SmuAvailable && _hw.Amd!.Smu.Messages.HasCurveOptimizer;
-            // The ratio stepper drives the Intel turbo table; nothing on the SMU side steps safely on a timer.
-            _autoPanel.Visible = false;
-            _toolRow.Height = 34;
             // The live line reports Intel P/E/ring ratios and VID; on AMD it would only hold an empty row.
             _lblLive.Visible = false;
         }
         else _btnPerCore.Enabled = _hw.Cpu != null;
         SetStatus($"Ready  ·  {_hw.DriverStatus}", false);
 
-        _autoTimer.Tick += (_, _) => AutoTick();
         // Low rate on purpose: the BCLK row needs a measurement and the Vcore annotation a sample,
         // and nothing on this window justifies hammering the hardware.
         _slowRefresh.Tick += (_, _) => SlowTick();
@@ -464,10 +741,9 @@ public sealed class MainForm : Form
             return;
         }
         _slowRefresh.Stop();
-        _autoTimer.Stop();
         _logForm.AllowClose = true;
         _logForm.Close();
-        _hw.Dispose();
+        _runtimeHardware?.Dispose();
     }
 
     private void AppendLog(string msg)
@@ -479,7 +755,8 @@ public sealed class MainForm : Form
     private void SetStatus(string text, bool error)
     {
         _lblStatus.Text = text;
-        _lblStatus.ForeColor = error ? Theme.Danger : Theme.Muted;
+        _lblStatus.ForeColor = error ? Theme.Danger : Theme.Text;
+        _resultTip.SetToolTip(_lblStatus, text);
     }
 
     private void ToggleLog()
@@ -490,6 +767,7 @@ public sealed class MainForm : Form
 
     private void SlowTick()
     {
+        if (_uiPreview) return;
         if (_applying) return;
         if (_hw.IsAmd) { AmdTick(); return; }
         if (_hw.Cpu == null) return;
@@ -497,9 +775,14 @@ public sealed class MainForm : Form
         _lblLive.Text = $"Live: P x{live.CoreRatio?.ToString() ?? "?"} E x{live.ECoreRatio?.ToString() ?? "?"} Ring x{live.RingRatio?.ToString() ?? "?"} | VID {live.CoreVid?.ToString("0.000") ?? "?"} V | " +
             (live.VcoreVrm is double rail ? $"Vcore {rail:0.000} V" : "Vcore unavailable");
         RefreshBclk();
-        // Board rails move on their own; keep the read-only rows current.
+        // Existing rail reads continue at the same rate; a staged writable request stays intact.
         foreach (var s in _hw.Settings.Where(s => s.Group == SettingGroup.Board && s.Available))
-            if (_boxes.TryGetValue(s, out var box)) { _hw.Refresh(s); box.Text = s.CurrentText; }
+            if (_boxes.TryGetValue(s, out var box))
+            {
+                bool untouched = !box.Focused && box.Text == s.CurrentText;
+                _hw.Refresh(s);
+                if (s.ReadOnly || untouched) box.Text = s.CurrentText;
+            }
 
         // The mailbox voltage rows were read once at start-up and then never again, so a single
         // read that came back wrong - one was seen reporting a domain as Auto that was in fact
@@ -510,24 +793,17 @@ public sealed class MainForm : Form
         {
             if (!_boxes.TryGetValue(s, out var box) || box.Focused) continue;
             string was = s.CurrentText;
-            if (box.Text != was) continue;
+            if (box.Text != was && !IsUntouchedCorePlaceholder(s, box.Text)) continue;
             _hw.Refresh(s);
-            if (s.CurrentText != was) box.Text = s.CurrentText;
-        }
-        if (_coreVoltageComparison != null)
-        {
-            var core = _hw.Settings.FirstOrDefault(s => s.Id == "core_v");
-            _coreVoltageComparison.Text = live.VcoreVrm is double measured
-                ? $"Measured Vcore: {measured:0.000} V" +
-                    (core?.LastError == null && core?.Current is double target
-                        ? $" ({(measured - target) * 1000:+0;-0;0} mV vs applied target)" : "")
-                : "Measured Vcore: sensor unavailable";
+            string display = CoreDisplayText(s);
+            if (box.Text != display) box.Text = display;
         }
     }
 
     /// <summary>Starts a base-clock measurement on a worker and shows the last finished one.</summary>
     private void RefreshBclk()
     {
+        if (_uiPreview) return;
         if (!_bclkBusy)
         {
             _bclkBusy = true;
@@ -543,23 +819,25 @@ public sealed class MainForm : Form
     /// <summary>AMD: measured base clock, and what the CPU is drawing against each power limit.</summary>
     private void AmdTick()
     {
+        if (_uiPreview) return;
         RefreshBclk();
         foreach (var (s, label) in _rangeLabels)
         {
             // An apply result stays readable for ten seconds before the live reading takes the label back.
             if (s.Live == null || (_rowResults.TryGetValue(s, out var shown) && DateTime.UtcNow - shown < TimeSpan.FromSeconds(10))) continue;
             label.Text = s.Live() is double now ? $"Live {s.Format(now)} {s.Unit}" : IdleText(s);
-            label.ForeColor = Theme.Muted;
+            label.ForeColor = s.ReadOnly ? Theme.Muted : Theme.Text;
         }
     }
 
     // ------------------------------------------------------------------ apply
     private void RefreshRows(string? message = null)
     {
+        if (_uiPreview) return;
         _rowResults.Clear();
         _hw.RefreshAll();
-        foreach (var (s, box) in _boxes) box.Text = s.CurrentText;
-        foreach (var (s, l) in _rangeLabels) { l.Text = IdleText(s); l.ForeColor = Theme.Muted; }
+        ShowReadbackTexts();
+        foreach (var (s, l) in _rangeLabels) { l.Text = !s.Available ? "unavailable" : IdleText(s); l.ForeColor = s.ReadOnly || !s.Available ? Theme.Muted : Theme.Text; }
         if (message != null) { AppendLog(message); SetStatus(message, false); }
     }
 
@@ -576,6 +854,7 @@ public sealed class MainForm : Form
     /// </summary>
     private void RunOnHardware(string busyText, Func<(string Status, bool Error)> work)
     {
+        if (_uiPreview) return;
         if (_applying) return;
         _applying = true;
         _slowRefresh.Stop();
@@ -604,16 +883,47 @@ public sealed class MainForm : Form
 
     private void ApplyAll()
     {
+        if (_uiPreview) return;
         if (_applying) return;
+        if (!PrepareMemoryForApply(out string? memoryError))
+        {
+            SetStatus(memoryError ?? "DIMM targets are invalid.", true);
+            AppendLog("Apply refused: " + memoryError);
+            return;
+        }
 
         // Parsing and the confirmation dialog stay on the UI thread, where they belong.
         var work = new List<(Setting Setting, TextBox Box, double Value)>();
         int rejected = 0;
+        var linkedRails = new HashSet<string>();
         foreach (var (s, box) in _boxes)
         {
-            if (s.ReadOnly) continue;
+            if (!s.Available || s.ReadOnly) continue;
+            if (_memoryLink?.IsSynced == true && MemoryVoltageLink.TryGetRail(s, out string rail))
+            {
+                if (!linkedRails.Add(rail)) continue;
+                var group = _memoryLink.GetGroup(s)!;
+                if (!group.Members.Any(member => IsMemoryTargetEdited(member, DraftText(member)))) continue;
+                if (!group.CanSync) { rejected++; continue; } // Defensive: preflight must already have rejected this group.
+                var linkedWork = new List<(Setting Setting, TextBox Box, double Value)>();
+                bool confirmed = true;
+                foreach (var member in group.Members)
+                {
+                    if (!_boxes.TryGetValue(member, out var peer)) continue;
+                    string target = DraftText(member).Trim();
+                    if (!IsMemoryTargetEdited(member, target)) continue;
+                    // The complete group was validated before any work was queued.
+                    if (!member.TryParse(target, out double linkedValue)) { confirmed = false; rejected++; break; }
+                    if (!ConfirmDangerous(member, linkedValue)) { confirmed = false; break; }
+                    linkedWork.Add((member, peer, linkedValue));
+                }
+                if (confirmed) work.AddRange(linkedWork);
+                else foreach (var member in group.Members) SetRowStatus(member, "group skipped", Theme.Muted);
+                continue;
+            }
             string text = box.Text.Trim();
             if (text.Length == 0) continue;
+            if (IsUntouchedCorePlaceholder(s, text)) continue;
             if (text.Equals(s.CurrentText, StringComparison.OrdinalIgnoreCase) && s.LastError == null) continue;
             if (!s.TryParse(text, out double value)) { AppendLog($"{s.Name}: '{text}' is not a number."); rejected++; SetRowStatus(s, "invalid", Theme.Danger); continue; }
             if (value != 0 && !ConfirmDangerous(s, value)) { SetRowStatus(s, "skipped", Theme.Muted); continue; }
@@ -639,7 +949,10 @@ public sealed class MainForm : Form
                 BeginInvoke(() =>
                 {
                     SetRowStatus(s, ignored ? "board ignored it" : ok ? s.LastResult ?? "applied" : "failed - see Log", ok && !ignored ? Theme.Ok : Theme.Danger);
-                    box.Text = s.CurrentText;
+                    _stagingMemory = true;
+                    try { box.Text = CoreDisplayText(s); _pendingMemoryEdits.Remove(s); }
+                    finally { _stagingMemory = false; }
+                    UpdateMemoryGroupLabels();
                 });
             }
             AppendLog($"Apply: {applied} applied, {failed} failed.");
@@ -651,6 +964,8 @@ public sealed class MainForm : Form
     {
         _btnApply.Enabled = on; _btnReset.Enabled = on;
         _btnApply.Text = on ? "Apply" : "Working...";
+        if (_splitDimms != null) _splitDimms.Enabled = on;
+        if (_syncDimms != null) _syncDimms.Enabled = on;
     }
 
     private bool ConfirmDangerous(Setting s, double value)
@@ -682,8 +997,9 @@ public sealed class MainForm : Form
 
     private void RestoreDefaults()
     {
+        if (_uiPreview) return;
         if (_applying) return;
-        if (MessageBox.Show(this, $"Put every value back to what it was when {AppName} started?", AppName, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        if (MessageBox.Show(this, "Reset changed writable settings to their existing defaults? Voltage overrides may return to Auto.", AppName, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
         // On a worker for the same reason as Apply: putting the base clock and VDD2 back walks
         // them a step at a time, measuring each, which is seconds of work.
         RunOnHardware("Restoring...", () =>
@@ -693,18 +1009,45 @@ public sealed class MainForm : Form
             BeginInvoke(() =>
             {
                 _rowResults.Clear();
-                foreach (var (s, box) in _boxes) box.Text = s.CurrentText;
-                foreach (var (s, l) in _rangeLabels) { l.Text = IdleText(s); l.ForeColor = Theme.Muted; }
+                ShowReadbackTexts();
+                foreach (var (s, l) in _rangeLabels) { l.Text = !s.Available ? "unavailable" : IdleText(s); l.ForeColor = s.ReadOnly || !s.Available ? Theme.Muted : Theme.Text; }
             });
-            string result = failures == 0 ? "Reset: start-up values restored." : $"Reset: {failures} setting(s) failed; see Log.";
+            string result = failures == 0 ? "Reset to Default: defaults/Auto restored." : $"Reset to Default: {failures} setting(s) failed; see Log.";
             AppendLog(result);
             return (result, failures > 0);
         });
     }
 
-    // ------------------------------------------------------------------ per core / auto
+    private void ShowReadbackTexts()
+    {
+        _stagingMemory = true;
+        try
+        {
+            foreach (var (setting, box) in _boxes)
+                box.Text = CoreDisplayText(setting);
+            _pendingMemoryEdits.Clear();
+            _pendingSharedMemoryEdits.Clear(); _sharedDraftTexts.Clear();
+        }
+        finally { _stagingMemory = false; }
+        UpdateMemoryGroupLabels();
+    }
+
+    private bool CoreTargetReadFailed => _uiPreview ? _previewCoreReadFailed : _hw.CoreVoltageTargetReadFailed;
+
+    private string CoreDisplayText(Setting setting) => setting.Id == "core_v" && (!setting.Available || CoreTargetReadFailed)
+        ? "Not read" : setting.CurrentText;
+
+    private bool IsUntouchedCorePlaceholder(Setting setting, string text) => setting.Id == "core_v" &&
+        text.Equals("Not read", StringComparison.OrdinalIgnoreCase) && (!setting.Available || CoreTargetReadFailed);
+
+    private static bool IsMemoryTargetEdited(Setting setting, string text) => (setting.LastError != null && setting.Available && !setting.ReadOnly) ||
+        !setting.TryParse(text, out double target) || !setting.TryParse(setting.CurrentText, out double current) ||
+        Math.Abs(target - current) >= 0.0000001;
+
+    // ------------------------------------------------------------------ manual per core
     private void OpenPerCore()
     {
+        if (_uiPreview) return;
         if (_hw.Amd != null)
         {
             using var co = new CurveOptimizerForm(_hw);
@@ -718,35 +1061,12 @@ public sealed class MainForm : Form
         RefreshRows();
     }
 
-    private void ToggleAuto()
-    {
-        if (_autoTimer.Enabled) { _autoTimer.Stop(); _btnAuto.Text = "Start"; SetStatus("Auto stepping stopped.", false); return; }
-        if (!double.TryParse(_txtAutoInterval.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double sec) || sec < 0.5) { SetStatus("Auto: interval must be at least 0.5 s.", true); return; }
-        if (!double.TryParse(_txtAutoStep.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double step) || step == 0) { SetStatus("Auto: step must be non-zero.", true); return; }
-        _autoTimer.Interval = (int)(sec * 1000);
-        _autoTimer.Start();
-        _btnAuto.Text = "Stop";
-        SetStatus($"Auto: CPU ratio {(step > 0 ? "+" : "")}{step} every {sec} s until a write fails or you press Stop.", false);
-    }
-
-    private void AutoTick()
-    {
-        if (_applying) return; // an apply is on a worker; do not write from here as well
-        var s = _hw.Settings.FirstOrDefault(x => x.Id == "cpu_ratio");
-        if (s == null || !s.Available || s.ReadOnly || s.Current is not double cur) { ToggleAuto(); return; }
-        double.TryParse(_txtAutoStep.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double step);
-        double next = cur + step;
-        if (next > s.Max || next < s.Min || !_hw.Apply(s, next)) { ToggleAuto(); SetStatus($"Auto stopped at x{s.CurrentText}: the next step was rejected.", true); return; }
-        if (_boxes.TryGetValue(s, out var box)) box.Text = s.CurrentText;
-        SetStatus($"Auto: CPU ratio now x{s.CurrentText}.", false);
-    }
-
     private void OnKeyDown(object? sender, KeyEventArgs e)
     {
+        if (_uiPreview) return;
         switch (e.KeyCode)
         {
             case Keys.Enter when ActiveControl is not Button: ApplyAll(); e.Handled = true; e.SuppressKeyPress = true; break;
-            case Keys.F6: ToggleAuto(); e.Handled = true; break;
         }
     }
 }
